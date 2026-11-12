@@ -9,7 +9,7 @@ rem    4. add Desktop + Start Menu shortcuts and launch the app
 rem  Run it again any time to repair/update.  "install.bat /uninstall" removes it.
 rem ===================================================================
 setlocal EnableExtensions
-set "REPO=OWNER/shared-cockpit"
+set "REPO=Laws0fPhysics1/Shared-Cockpit"
 set "BRANCH=main"
 set "DEST=%LOCALAPPDATA%\SharedCockpit"
 title Shared Cockpit setup
