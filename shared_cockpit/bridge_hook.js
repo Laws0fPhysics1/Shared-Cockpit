@@ -17,15 +17,20 @@
             if (!open || !sock) { return; }
             try { sock.send(JSON.stringify(obj)); } catch (e) { }
         }
+        function instruments() {
+            var panel = window.document.getElementById("panel");
+            return panel ? panel.children : [];
+        }
+        // Instrument GUIDs are assigned at runtime and differ between the two PCs, so a
+        // targeted event is identified by the instrument's element name instead.
         function replay(msg) {
             try {
-                var panel = window.document.getElementById("panel");
-                if (!panel) { return; }
+                var list = instruments();
                 var args = [msg.n].concat(msg.a || []);
-                for (var i = 0; i < panel.children.length; i++) {
-                    var instrument = panel.children[i];
+                for (var i = 0; i < list.length; i++) {
+                    var instrument = list[i];
                     if (!instrument || typeof instrument.onInteractionEvent !== "function") { continue; }
-                    if (msg.g && instrument.getAttribute("Guid") != msg.g) { continue; }
+                    if (msg.i && String(instrument.tagName).toLowerCase() !== msg.i) { continue; }
                     try { instrument.onInteractionEvent(args); } catch (e) { }
                 }
             } catch (e) { }
@@ -40,7 +45,7 @@
             }
             sock.onopen = function () {
                 open = true;
-                send({ t: "hello", panel: panelName(), v: 1 });
+                send({ t: "hello", panel: panelName(), v: 2 });
             };
             sock.onmessage = function (ev) {
                 try {
@@ -60,7 +65,19 @@
         Coherent.on("OnInteractionEvent", function (_target, _args) {
             try {
                 if (!_args || !_args.length) { return; }
-                send({ t: "h", n: String(_args[0]), a: Array.prototype.slice.call(_args, 1), g: _target || null });
+                var tag = null;
+                if (_target) {
+                    // Targeted at one instrument: only the panel holding it reports it.
+                    var list = instruments();
+                    for (var i = 0; i < list.length; i++) {
+                        if (list[i] && list[i].getAttribute && list[i].getAttribute("Guid") == _target) {
+                            tag = String(list[i].tagName).toLowerCase();
+                            break;
+                        }
+                    }
+                    if (!tag) { return; }
+                }
+                send({ t: "h", n: String(_args[0]), a: Array.prototype.slice.call(_args, 1), i: tag });
             } catch (e) { }
         });
         connect();

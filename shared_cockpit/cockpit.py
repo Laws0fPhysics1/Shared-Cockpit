@@ -35,7 +35,11 @@ LV_BLOCK = 100               # L:vars per data definition
 LV_MAX = 2000
 LV_ID0 = 50000               # define/request ids for L:var reads (per generation)
 LV_WRITE_ID0 = 70000         # define ids for single L:var writes
-IE_GET_ID0 = 90000           # request ids for GetInputEvent snapshots
+IE_GET_ID0 = 90000           # request ids for GetInputEvent snapshots (Match co-pilot)
+IE_INIT_ID0 = 95000          # request ids for the initial input-event values
+K_GROUP = 77                 # notification group for relayed key events
+K_ECHO_S = 1.0               # a K event we fired ourselves is ignored when the sim reports it
+H_QUIET_S = 0.4              # K events right after a button press are its effects: both sims make them
 H_DEDUPE = 0.06              # s: every cockpit screen reports the same press once
 NOISE_WINDOW, NOISE_SECONDS = 10, 8   # changed in 8 of the last 10 s => "changes on its own"
 TMP = os.path.join(tempfile.gettempdir(), "SharedCockpit")
@@ -70,6 +74,7 @@ class CockpitSync:
         self.lv_blocks = []          # (req_id, Block, names)
         self.lv_gen = 0
         self.lv_prev, self.lv_known, self.lv_write = {}, {}, {}
+        self.lv_recent = {}
         self.lv_secs = {}            # name -> deque of whole seconds it changed in
         self.lv_ignored = set()
         self.lv_out = {}
@@ -78,6 +83,15 @@ class CockpitSync:
         self._ignore = _load_ignore()
         # H events
         self._h_recent = {}
+        # K events (autopilot knobs/buttons): relayed as causes
+        self.k_by_id = {}
+        self._k_sc = None
+        self._k_sent = {}            # (name, data) -> deque of times we fired it
+        self._h_quiet_until = 0.0
+        self._k_secs = {}
+        self._k_noisy = set()
+        # initial input-event values (so a knob/key "action" is recognised on first use)
+        self._ie_init = {}
         # snapshots / flight transfer
         self._pending_state = None
         self._pending_flt = None
@@ -149,6 +163,7 @@ class CockpitSync:
                     self.slog.add("fail", "mf", note=f"MobiFlight client unavailable: {ex}")
             self._want_list = True
         self._mf_sc = sc
+        self._watch_k_events(sc)
         if self._load_wait:                 # a co-pilot flight just loaded: match its state
             self._load_wait = None
             self._match_at = net.now() + 6.0
@@ -201,6 +216,8 @@ class CockpitSync:
             p = self._pending_state
             if p and m[1] in p["ie_req"]:
                 p["ie"][p["ie_req"][m[1]]] = m[2]
+            elif m[1] in self._ie_init:
+                self.e.ie_last.setdefault(self._ie_init.pop(m[1]), m[2])
             return True
         return False
 
@@ -213,6 +230,99 @@ class CockpitSync:
                 self._on_lvars(names, blk.unpack(raw))
                 return True
         return False
+
+    # ------------------------------------------------------------------ K events
+    def _watch_k_events(self, sc):
+        if self._k_sc is sc or not hasattr(sc, "watch_event"):
+            return
+        self._k_sc = sc
+        self.k_by_id = {}
+        ok = 0
+        for name in sd.K_RELAY:
+            try:
+                self.k_by_id[sc.watch_event(K_GROUP, name)] = name
+                ok += 1
+            except Exception as ex:
+                self.slog.add("fail", "k", name, note=str(ex))
+        try:
+            sc.set_group_priority(K_GROUP)
+        except Exception as ex:
+            self.slog.add("fail", "k", note=f"group priority: {ex}")
+        self.slog.add("info", "k", note=f"watching {ok} autopilot key events")
+
+    def note_sent(self, name, data=0):
+        """The engine fired K:<name> itself: don't relay the sim's report of it."""
+        if name in sd.K_RELAY:
+            self._k_sent.setdefault((name, int(data) & 0xFFFFFFFF), deque()).append(net.now())
+
+    def _is_own_k(self, name, data):
+        dq = self._k_sent.get((name, data))
+        now = net.now()
+        while dq and now - dq[0] > K_ECHO_S:
+            dq.popleft()
+        if dq:
+            dq.popleft()
+            return True
+        return False
+
+    def on_k(self, eid, data):
+        """A watched key event fired in our sim. Returns True if it was one of ours."""
+        name = self.k_by_id.get(eid)
+        if not name:
+            return False
+        data = int(data) & 0xFFFFFFFF
+        if self._is_own_k(name, data):
+            return True                         # we fired it (co-pilot's replay): no echo
+        now = net.now()
+        if now < self._h_quiet_until:
+            # Fired by a cockpit instrument reacting to a button press; the same press
+            # is replayed on the other sim, whose instrument fires it there too.
+            self.slog.add("skip", "k", name, data, "effect of a button press (both sims make it)")
+            return True
+        if name in self._k_noisy:
+            return True
+        dq = self._k_secs.setdefault(name, deque())
+        sec = int(now)
+        if not dq or dq[-1] != sec:
+            dq.append(sec)
+        while dq and dq[0] <= sec - 10:
+            dq.popleft()
+        if len(dq) >= 8:
+            self._k_noisy.add(name)
+            self.slog.add("skip", "k", name, data, "fires on its own - not relayed this session")
+            return True
+        if self.e.link:
+            self.e._send({"t": "k", "n": name, "d": data})
+            self.slog.add("out", "k", name, data)
+        return True
+
+    def _replay_k(self, msg):
+        name, data = msg.get("n"), int(msg.get("d") or 0) & 0xFFFFFFFF
+        self.slog.add("in", "k", name, data)
+        if name not in sd.K_RELAY or not (self.e.sc and self.e.ready):
+            self.slog.add("skip", "k", name, data)
+            return
+        try:
+            self.note_sent(name, data)
+            self.e.sc.send_event(name, data)
+            self.slog.add("apply", "k", name, data)
+        except Exception as ex:
+            self.slog.add("fail", "k", name, data, str(ex))
+
+    def request_ie_snapshot(self):
+        """Read every input event's current value once, so the first press of an
+        action-type event (value doesn't change) is recognised as an action."""
+        sc, e = self.e.sc, self.e
+        if sc is None or not getattr(sc, "has_get_input_event", False):
+            return
+        self._ie_init = {}
+        for i, (name, h) in enumerate(sorted(e.ie_by_name.items())):
+            rid = IE_INIT_ID0 + i
+            try:
+                sc.get_input_event(rid, h)
+                self._ie_init[rid] = name
+            except Exception:
+                break
 
     # ------------------------------------------------------------------ L:vars
     def _on_lvars(self, names, vals):
@@ -239,6 +349,9 @@ class CockpitSync:
             known = self.lv_known.get(n)
             if known is not None and abs(v - known) < 1e-6:
                 continue                      # our own apply of the co-pilot's value
+            rec = self.lv_recent.get(n)
+            if rec and any(abs(v - rv) < 1e-6 and t - rt < sd.ECHO_S for rt, rv in rec):
+                continue                      # a late reading of a value the co-pilot sent
             self.lv_known[n] = v
             if self.e.link:
                 self.lv_out[n] = v
@@ -248,8 +361,11 @@ class CockpitSync:
         if not (sc and self.e.ready):
             return 0
         done = 0
+        now = net.now()
         for n, v in values.items():
             self.lv_known[n] = v
+            rec = self.lv_recent.setdefault(n, deque(maxlen=12))
+            rec.append((now, v))
             if n in self.lv_ignored:
                 self.slog.add("skip", source, n, v, "ignored here (changes on its own)")
                 continue
@@ -284,8 +400,9 @@ class CockpitSync:
         if now - self._h_recent.get(n, -1.0) < H_DEDUPE:
             return                              # same press reported by another screen
         self._h_recent[n] = now
+        self._h_quiet_until = now + H_QUIET_S
         if self.e.link:
-            self.e._send({"t": "h", "n": n, "a": msg.get("a") or [], "g": msg.get("g")})
+            self.e._send({"t": "h", "n": n, "a": msg.get("a") or [], "i": msg.get("i")})
             self.slog.add("out", "button", n)
         else:
             self.slog.add("skip", "button", n, note="not connected")
@@ -293,8 +410,9 @@ class CockpitSync:
     def _replay_h(self, msg):
         n = msg.get("n")
         self.slog.add("in", "button", n)
+        self._h_quiet_until = net.now() + H_QUIET_S
         if self.bridge_screens():
-            self.bridge.broadcast({"t": "h", "n": n, "a": msg.get("a") or [], "g": msg.get("g")})
+            self.bridge.broadcast({"t": "h", "n": n, "a": msg.get("a") or [], "i": msg.get("i")})
             self.slog.add("apply", "button", n)
         elif self.mf and getattr(self.mf, "ready", False):
             self.mf.execute(f"(>H:{n})")
@@ -310,6 +428,8 @@ class CockpitSync:
         t = msg.get("t")
         if t == "h":
             self._replay_h(msg)
+        elif t == "k":
+            self._replay_k(msg)
         elif t == "lv":
             vals = msg.get("v") or {}
             for n, v in vals.items():

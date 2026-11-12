@@ -162,9 +162,41 @@ def tolerance(unit):
         return 5.0
     return 0.5  # bools, indexes, Hz, BCD
 
-# Input events (MSFS 2024 B: vars) whose names contain these are continuous
-# flight controls; they're carried by CONTROLS instead, so don't mirror them.
+# Input events (B: vars) whose names contain these are never mirrored by value:
+# - continuous flight controls (carried by CONTROLS),
+# - "action" events (knob turns, key presses): their value is not a position, so
+#   copying it re-fires the action on the other sim (the A320 altitude knob wound
+#   down 1000 ft per copy). Their CAUSE is relayed instead (K events, H events).
+# - self-updating helpers that ping-pong (seen in a real A320 flight).
 INPUT_EVENT_SKIP = ("YOKE", "PEDAL", "RUDDER_AXIS", "THROTTLE", "MIXTURE", "PROPELLER",
                     "CONDITION_LEVER", "TOE_BRAKE", "BRAKE_AXIS", "ELEVATOR_AXIS",
                     "AILERON_AXIS", "STICK", "COLLECTIVE", "CYCLIC", "TILLER", "CAMERA",
-                    "VIEW")
+                    "VIEW",
+                    "AUTOPILOT", "FMC_", "FMS_", "CDU", "FCU", "KEYBOARD", "SOFTKEY",
+                    "TRIM", "MB_ENSURE", "_INC", "_DEC")
+
+# Key events relayed as CAUSES: when one pilot turns a knob or pushes an autopilot
+# button, the same K event fires on the other sim. Relative ones (INC/DEC, toggles)
+# must never also be mirrored by value. Unknown names for an aircraft are harmless.
+K_RELAY = [
+    "AP_ALT_VAR_INC", "AP_ALT_VAR_DEC", "AP_SPD_VAR_INC", "AP_SPD_VAR_DEC",
+    "AP_MACH_VAR_INC", "AP_MACH_VAR_DEC", "HEADING_BUG_INC", "HEADING_BUG_DEC",
+    "AP_VS_VAR_INC", "AP_VS_VAR_DEC", "VOR1_OBI_INC", "VOR1_OBI_DEC",
+    "VOR2_OBI_INC", "VOR2_OBI_DEC", "KOHLSMAN_INC", "KOHLSMAN_DEC", "BAROMETRIC",
+    "AP_MASTER", "AUTOPILOT_ON", "AUTOPILOT_OFF", "AUTOPILOT_DISENGAGE_TOGGLE",
+    "AP_PANEL_HEADING_HOLD", "AP_PANEL_ALTITUDE_HOLD", "AP_PANEL_SPEED_HOLD",
+    "AP_PANEL_MACH_HOLD", "AP_PANEL_VS_HOLD", "AP_PANEL_VS_ON",
+    "AP_HDG_HOLD", "AP_ALT_HOLD", "AP_NAV1_HOLD", "AP_APR_HOLD", "AP_LOC_HOLD",
+    "AP_BC_HOLD", "AP_VS_HOLD", "AP_ATT_HOLD", "AP_WING_LEVELER", "AP_N1_HOLD",
+    "AP_AIRSPEED_HOLD", "AP_MACH_HOLD", "FLIGHT_LEVEL_CHANGE", "YAW_DAMPER_TOGGLE",
+    "TOGGLE_FLIGHT_DIRECTOR", "AUTO_THROTTLE_ARM", "AUTO_THROTTLE_TO_GA",
+    "AP_SPEED_SLOT_INDEX_SET", "ALTITUDE_SLOT_INDEX_SET", "HEADING_SLOT_INDEX_SET",
+    "VS_SLOT_INDEX_SET",
+]
+
+# Switch keys whose final value is synced only after it stops changing (the knob
+# turns themselves travel as K events); prevents fights while a knob is turning.
+SETTLE_KEYS = {"ap_hdg_bug", "ap_alt_sel", "ap_vs_sel", "ap_spd_sel", "baro", "obs1", "obs2",
+               "elev_trim", "rudder_trim"}
+SETTLE_S = 0.7
+ECHO_S = 2.0          # a value applied from the co-pilot within this long is never sent back

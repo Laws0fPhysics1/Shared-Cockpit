@@ -47,6 +47,21 @@ add-ons to MSFS's Community folder (manage them on the **Pre-flight** tab):
 
 FMS sync works by replaying key presses (like YourControls does), so both FMSes must start
 the same: use **Copy co-pilot's flight**, then program the FMS together.
+
+**Restart MSFS after installing or updating the bridge**: the sim only loads add-ons at startup.
+The app refreshes its own bridge when a new version needs it, and the Pre-flight tab says so.
+
+### How the cockpit is synced: causes, not just results
+- **Button presses and knob turns are replayed as what they are.** Glass-cockpit buttons and FMS
+  keys travel as button events (via the bridge); autopilot knobs and buttons that work through
+  the sim's key commands (`AP_ALT_VAR_INC`, `HEADING_BUG_DEC`, `AP_MASTER`, ...) are watched and
+  fired on the other sim. Turning the altitude knob up 10 notches turns it up 10 notches there.
+- **Switch positions are copied as values** (lights, overhead, radios). Knob/key "input events"
+  never are: their value isn't a position, and copying it re-fires the action.
+- **No echoes.** A value or command that just arrived from your co-pilot is never sent back,
+  even if the sim reports an older reading a frame later.
+- **Autopilot selectors settle.** Their final value is also synced 0.7 s after the knob stops,
+  as a backup, without fighting while it turns.
 In MSFS 2024 the cockpit UI files are packed, so button/FMS capture is **2020-only for now**;
 2024 still gets the overhead (L:vars) through MobiFlight. Another add-on that also replaces
 `VCockpit.js` (e.g. YourControls) conflicts; the Pre-flight tab warns about it.

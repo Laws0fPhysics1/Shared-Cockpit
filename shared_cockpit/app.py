@@ -406,6 +406,11 @@ class App:
         self.l_bridge.configure(text="\n".join(x for x in lines if x))
         need = st.get("sim_found") and (not st.get("bridge_installed") and st.get("capture_supported")
                                         or st.get("bridge_current") is False or not st.get("mobiflight"))
+        if st.get("bridge_installed") and st.get("bridge_current") is False and not getattr(self, "_auto_repaired", False):
+            self._auto_repaired = True           # our own add-on: refresh it without asking
+            self.log("Updating the in-sim bridge to this version. Restart MSFS afterwards.")
+            self._install_bridge()
+            return
         key = f"bridge_prompted_{flavor.KEY}"
         if offer and need and not self.s.get(key):
             self.s[key] = True

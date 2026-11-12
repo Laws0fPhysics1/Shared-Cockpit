@@ -25,7 +25,7 @@ import urllib.request
 import zipfile
 
 BRIDGE_NAME = "shared-cockpit-bridge"
-BRIDGE_VERSION = "1.0.0"
+BRIDGE_VERSION = "1.1.0"   # bump whenever bridge_hook.js changes: installed copies then show "update"
 DEFAULT_PORT = 50556
 MOBIFLIGHT_NAME = "mobiflight-event-module"
 MOBIFLIGHT_URL = ("https://github.com/MobiFlight/MobiFlight-WASM-Module/releases/download/"
@@ -225,7 +225,8 @@ def status(key):
             try:
                 with open(os.path.join(pkg, "bridge.json"), encoding="utf-8") as f:
                     meta = json.load(f)
-                st["bridge_current"] = meta.get("source_sha256") == _sha256_file(vc)
+                st["bridge_current"] = (meta.get("source_sha256") == _sha256_file(vc)
+                                        and meta.get("version") == BRIDGE_VERSION)
             except (OSError, ValueError):
                 st["bridge_current"] = False
         for name in sorted(os.listdir(com)):
@@ -239,7 +240,8 @@ def status(key):
         elif not st["bridge_installed"]:
             st["message"] = "In-sim bridge not installed."
         elif not st["bridge_current"]:
-            st["message"] = "A sim update changed the cockpit core file: reinstall the bridge, then restart MSFS."
+            st["message"] = ("The bridge needs a refresh (new Shared Cockpit version or MSFS update): "
+                             "click Install / repair, then restart MSFS.")
         elif st["conflicts"]:
             st["message"] = ("Other add-ons also replace the cockpit core file (" + ", ".join(st["conflicts"]) +
                              "). Only one can win; remove them from Community while using Shared Cockpit.")

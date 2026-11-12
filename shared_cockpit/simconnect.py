@@ -195,6 +195,32 @@ class SimConnect:
         hr = self.dll.SimConnect_SubscribeToSystemEvent(self.h, event_id, name.encode())
         self._ok(hr, f"SubscribeToSystemEvent({name})")
 
+    # -- watching key events (K:) fired in the sim ---------------------------
+    def watch_event(self, group_id, name):
+        """Get a ("event", id, data) message whenever K:<name> fires in the sim
+        (cockpit click, keyboard, gauge). Non-maskable: the sim still acts on it."""
+        eid = self.event_id(name)
+        d, H, D = self.dll, wintypes.HANDLE, wintypes.DWORD
+        if not getattr(self, "_watch_proto", False):
+            d.SimConnect_AddClientEventToNotificationGroup.argtypes = [H, D, D, wintypes.BOOL]
+            d.SimConnect_AddClientEventToNotificationGroup.restype = c_long
+            d.SimConnect_SetNotificationGroupPriority.argtypes = [H, D, D]
+            d.SimConnect_SetNotificationGroupPriority.restype = c_long
+            self._watch_proto = True
+        hr = d.SimConnect_AddClientEventToNotificationGroup(self.h, group_id, eid, False)
+        self._ok(hr, f"AddClientEventToNotificationGroup({name})")
+        return eid
+
+    def set_group_priority(self, group_id, priority=GROUP_PRIORITY_HIGHEST):
+        hr = self.dll.SimConnect_SetNotificationGroupPriority(self.h, group_id, priority)
+        self._ok(hr, "SetNotificationGroupPriority")
+
+    def event_name(self, eid):
+        for n, i in self._event_ids.items():
+            if i == eid:
+                return n
+        return None
+
     # -- input events (B: vars, needs the MSFS SDK SimConnect.dll) -------
     def subscribe_all_input_events(self):
         hr = self.dll.SimConnect_SubscribeInputEvent(self.h, 0)

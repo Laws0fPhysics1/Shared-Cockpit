@@ -114,7 +114,7 @@ if /i "!OPT!"=="/fast" goto :skiptests
 echo.
 echo Running tests (about two minutes; "publish.bat /fast" skips them)...
 set "FAILED="
-for %%t in (loopback dryrun smooth updater cockpit wsbridge mobiflight bridge_install) do (
+for %%t in (loopback dryrun smooth updater cockpit autopilot hook wsbridge mobiflight bridge_install) do (
   %PY% tests\test_%%t.py >"%TEMP%\sc_test_%%t.log" 2>&1
   if errorlevel 1 (
     echo   %%t  FAILED  - log: %TEMP%\sc_test_%%t.log

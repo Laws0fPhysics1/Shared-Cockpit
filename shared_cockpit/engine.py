@@ -134,6 +134,9 @@ class Engine:
         self.sw_set_blocks = {}
 
         self.ie_by_hash, self.ie_by_name, self.ie_applied = {}, {}, {}
+        self.ie_last, self.ie_recent, self.ie_secs = {}, {}, {}
+        self.ie_action, self.ie_noisy = set(), set()
+        self.sw_recent, self.sw_pending = {}, {}
         self.ie_type, self.ie_double = {}, None
         self.exc_count = 0
 
@@ -435,6 +438,8 @@ class Engine:
         elif kind == "event":
             if m[1] in (EV_AIRCRAFT_LOADED, EV_FLIGHT_LOADED, EV_SIM_START):
                 self.sc.request(REQ_INFO, DEF_INFO, PERIOD_ONCE)
+            else:
+                self.cp.on_k(m[1], m[2])
         elif kind == "exception":
             self.exc_count += 1
             if self.exc_count <= 15:
@@ -453,6 +458,7 @@ class Engine:
             codes = list(self.ie_type.values())
             self.ie_double = max(set(codes), key=codes.count) if codes else None
             self.status["ie"] = f"input events: {len(self.ie_by_name)} mapped"
+            self.cp.request_ie_snapshot()
         elif kind == "input_event":
             et = self.ie_type.get(m[1])
             if et is None or et == self.ie_double:
@@ -735,8 +741,15 @@ class Engine:
             known = self.sw_known.get(key)
             if known is not None and abs(v - known) <= tol:
                 continue                        # change was us applying the peer's value
+            t = net.now()
+            rec = self.sw_recent.get(key)
+            if rec and any(abs(v - rv) <= tol and t - rt < sd.ECHO_S for rt, rv in rec):
+                continue                        # late reading of a value the co-pilot sent
             self.sw_known[key] = v
-            out[key] = v
+            if key in sd.SETTLE_KEYS:
+                self.sw_pending[key] = (v, t)   # sent once the knob stops moving
+            else:
+                out[key] = v
         if out:
             self._send({"t": "sw", "s": out})
             for k, v in out.items():
@@ -752,6 +765,8 @@ class Engine:
                 continue
             _, var, unit, kind, arg, scale = s
             self.sw_known[key] = v
+            self.sw_pending.pop(key, None)          # the co-pilot's newer value wins
+            self.sw_recent.setdefault(key, deque(maxlen=12)).append((net.now(), v))
             cur = self.sw_prev.get(key)
             if cur is not None and abs(cur - v) <= sd.tolerance(unit):
                 continue
@@ -760,13 +775,16 @@ class Engine:
                 if kind == "set":
                     self.sw_set_blocks[key].write([v])
                 elif kind == "event":
+                    self.cp.note_sent(arg, round(v * scale))
                     self.sc.send_event(arg, round(v * scale))
                 elif kind == "onoff":
+                    self.cp.note_sent(arg[0] if v >= 0.5 else arg[1])
                     self.sc.send_event(arg[0] if v >= 0.5 else arg[1])
                 elif kind == "toggle":
                     if both_ie:
                         continue
                     if cur is None or (cur >= 0.5) != (v >= 0.5):
+                        self.cp.note_sent(arg)
                         self.sc.send_event(arg)
             except SimConnectError as e:
                 self.log(f"Could not apply {key}: {e}")
@@ -777,11 +795,33 @@ class Engine:
         if not (self.link and self.peer.get("ie")):
             return
         name = self.ie_by_hash.get(h)
-        if not name or any(k in name.upper() for k in sd.INPUT_EVENT_SKIP):
+        if not name:
             return
-        a = self.ie_applied.get(name)
-        if a is not None and abs(a - v) < 1e-6:
-            del self.ie_applied[name]          # echo of the peer's change
+        prev = self.ie_last.get(name)
+        self.ie_last[name] = v
+        if any(k in name.upper() for k in sd.INPUT_EVENT_SKIP):
+            return
+        if name in self.ie_action or name in self.ie_noisy:
+            return
+        if prev is not None and abs(v - prev) < 1e-9:
+            # Fired again with the same value: an action (key press, knob turn), not a
+            # switch position. Copying it would re-fire the action on the other sim.
+            self.ie_action.add(name)
+            self.cp.slog.add("skip", "input", name, v, "action event (not a position): not mirrored")
+            return
+        t = net.now()
+        rec = self.ie_recent.get(name)
+        if rec and any(abs(v - rv) < 1e-6 and t - rt < sd.ECHO_S for rt, rv in rec):
+            return                              # echo / late reading of the co-pilot's value
+        dq = self.ie_secs.setdefault(name, deque())
+        sec = int(t)
+        if not dq or dq[-1] != sec:
+            dq.append(sec)
+        while dq and dq[0] <= sec - 10:
+            dq.popleft()
+        if len(dq) >= 8:
+            self.ie_noisy.add(name)
+            self.cp.slog.add("skip", "input", name, v, "changes on its own - ignored this session")
             return
         self._send({"t": "ie", "n": name, "v": v})
         self.cp.slog.add("out", "input", name, v)
@@ -792,7 +832,8 @@ class Engine:
         h = self.ie_by_name.get(name)
         if h is None:
             return
-        self.ie_applied[name] = v
+        self.ie_recent.setdefault(name, deque(maxlen=12)).append((net.now(), v))
+        self.ie_last[name] = v
         try:
             self.sc.set_input_event(h, v)
             self.cp.slog.add("apply", "input", name, v)
@@ -972,6 +1013,14 @@ class Engine:
         if not self.ready:
             return
         self.cp.tick(t)
+        if self.sw_pending:
+            done = {k: v for k, (v, t0) in self.sw_pending.items() if t - t0 >= sd.SETTLE_S}
+            for k in done:
+                del self.sw_pending[k]
+            if done and self.link:
+                self._send({"t": "sw", "s": done})
+                for k, v in done.items():
+                    self.cp.slog.add("out", "switch", k, v, "settled")
         if self.link and self._env and t - self._last_env_send > 2.0:
             self._last_env_send = t
             self._send(self._env_message())

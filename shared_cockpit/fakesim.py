@@ -73,6 +73,7 @@ class FakeSim:
             "L:XMLVAR_BLINK_STATE": 0.0,      # filtered by name
         }
         self.events_by_name = {}
+        self._eids, self.watched = {}, {}     # K events the client watches -> id
         self.scratchpad = ""                   # pretend MCDU scratchpad (H-event keys)
         self.loaded_flights = 0
         self.alt_base, self.alt_amp = 3000.0, 150.0   # tests can fly it low
@@ -117,9 +118,23 @@ class FakeSim:
                                      s["PLANE ALTITUDE"], True))
 
     def send_event(self, name, value=0):
+        value = int(value) & 0xFFFFFFFF
+        if name in self.watched:                # the sim reports every watched K event
+            self.queue.append(("event", self.watched[name], value))
         if value & 0x80000000:
             value -= 1 << 32
         with self.lock:
+            rel = {"AP_ALT_VAR_INC": ("AUTOPILOT ALTITUDE LOCK VAR", 100),
+                   "AP_ALT_VAR_DEC": ("AUTOPILOT ALTITUDE LOCK VAR", -100),
+                   "HEADING_BUG_INC": ("AUTOPILOT HEADING LOCK DIR", 1),
+                   "HEADING_BUG_DEC": ("AUTOPILOT HEADING LOCK DIR", -1)}
+            if name in rel:
+                var, d = rel[name]
+                self.state[var] = self.state.get(var, 0.0) + d
+                return
+            if name == "AP_MASTER":
+                self.state["AUTOPILOT MASTER"] = 0.0 if self.state.get("AUTOPILOT MASTER", 0.0) >= 0.5 else 1.0
+                return
             if name in FREEZE_VARS:
                 self.state[FREEZE_VARS[name]] = 1.0 if value else 0.0
                 return
@@ -139,6 +154,21 @@ class FakeSim:
 
     def subscribe_system(self, event_id, name):
         self.events_by_name[name] = event_id
+
+    def event_id(self, name):
+        return self._eids.setdefault(name, 1000 + len(self._eids))
+
+    def watch_event(self, group_id, name):
+        eid = self.event_id(name)
+        self.watched[name] = eid
+        return eid
+
+    def set_group_priority(self, *_a):
+        pass
+
+    def user_event(self, name, data=0):
+        """A pilot turns a knob / pushes a button in this pretend cockpit."""
+        self.send_event(name, data)
 
     # -- dry-run stand-ins for the in-sim bridge / MobiFlight / flight files --
     def lvar_names(self):
