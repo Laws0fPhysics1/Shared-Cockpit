@@ -60,8 +60,16 @@ The app refreshes its own bridge when a new version needs it, and the Pre-flight
   never are: their value isn't a position, and copying it re-fires the action.
 - **No echoes.** A value or command that just arrived from your co-pilot is never sent back,
   even if the sim reports an older reading a frame later.
-- **Autopilot selectors settle.** Their final value is also synced 0.7 s after the knob stops,
-  as a backup, without fighting while it turns.
+- **Autopilot selectors are synced by slot** (1 = selected, 3 = what Airbus FCUs display) and
+  written the way the knob's own model code does it, so the altitude/heading/speed/VS bugs move
+  on both screens. Values follow a turning knob after a 0.3 s pause.
+- **Key commands are relayed only right after one of you touched a control.** Commands an
+  aircraft's own code fires by itself (an A320 FMS does this a lot) stay local: both sims make them.
+- **Aircraft whose autopilot panel is a cockpit screen** (Airbus FCU, Boeing MCP): generic autopilot
+  mode switches aren't pushed, the aircraft's own logic runs on both sims. AP on/off still syncs.
+- **Switches an aircraft flips by itself** (e.g. A320 automatic probe heat) are left alone.
+- **Captain and first officer FMS are mirrored** (Flight tab checkbox, on by default): a key on
+  either FMS goes to both FMS units on both PCs.
 In MSFS 2024 the cockpit UI files are packed, so button/FMS capture is **2020-only for now**;
 2024 still gets the overhead (L:vars) through MobiFlight. Another add-on that also replaces
 `VCockpit.js` (e.g. YourControls) conflicts; the Pre-flight tab warns about it.

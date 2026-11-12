@@ -74,7 +74,8 @@ class FakeSim:
         }
         self.events_by_name = {}
         self._eids, self.watched = {}, {}     # K events the client watches -> id
-        self.scratchpad = ""                   # pretend MCDU scratchpad (H-event keys)
+        self.scratchpad = ""                   # pretend captain MCDU scratchpad (H-event keys)
+        self.scratchpad2 = ""                  # pretend first officer MCDU
         self.loaded_flights = 0
         self.alt_base, self.alt_amp = 3000.0, 150.0   # tests can fly it low
         self.history = deque(maxlen=4000)              # (t, lat, lon, alt, frozen) per frame
@@ -130,7 +131,8 @@ class FakeSim:
                    "HEADING_BUG_DEC": ("AUTOPILOT HEADING LOCK DIR", -1)}
             if name in rel:
                 var, d = rel[name]
-                self.state[var] = self.state.get(var, 0.0) + d
+                for slot in (":1", ":3"):            # selected + displayed slots move together
+                    self.state[var + slot] = self.state.get(var + slot, 0.0) + d
                 return
             if name == "AP_MASTER":
                 self.state["AUTOPILOT MASTER"] = 0.0 if self.state.get("AUTOPILOT MASTER", 0.0) >= 0.5 else 1.0
@@ -178,11 +180,14 @@ class FakeSim:
     def press_h(self, name):
         """A pretend MCDU: CDU key events type into a scratchpad."""
         key = name.rsplit("_BTN_", 1)[-1] if "_CDU_" in name else ""
+        attr = "scratchpad2" if "_CDU_2_" in name else "scratchpad"
         with self.lock:
+            pad = getattr(self, attr)
             if key == "CLR":
-                self.scratchpad = self.scratchpad[:-1]
+                pad = pad[:-1]
             elif len(key) == 1:
-                self.scratchpad = (self.scratchpad + key)[-16:]
+                pad = (pad + key)[-16:]
+            setattr(self, attr, pad)
 
     def flight_save(self, path, title="", description="", flags=0):
         with self.lock:

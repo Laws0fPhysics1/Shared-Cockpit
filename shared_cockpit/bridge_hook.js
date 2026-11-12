@@ -21,6 +21,13 @@
             var panel = window.document.getElementById("panel");
             return panel ? panel.children : [];
         }
+        function instrumentTags() {
+            var out = [], list = instruments();
+            for (var i = 0; i < list.length; i++) {
+                if (list[i] && list[i].tagName) { out.push(String(list[i].tagName).toLowerCase()); }
+            }
+            return out;
+        }
         // Instrument GUIDs are assigned at runtime and differ between the two PCs, so a
         // targeted event is identified by the instrument's element name instead.
         function replay(msg) {
@@ -45,7 +52,14 @@
             }
             sock.onopen = function () {
                 open = true;
-                send({ t: "hello", panel: panelName(), v: 2 });
+                send({ t: "hello", panel: panelName(), v: 3, inst: instrumentTags() });
+                // instruments register a moment after the panel loads: report them again
+                var tries = 0;
+                var again = setInterval(function () {
+                    tries++;
+                    if (!open || tries > 6) { clearInterval(again); return; }
+                    send({ t: "inst", panel: panelName(), inst: instrumentTags() });
+                }, 5000);
             };
             sock.onmessage = function (ev) {
                 try {

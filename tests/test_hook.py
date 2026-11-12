@@ -46,6 +46,7 @@ setTimeout(function () {
   ws.onmessage({ data: JSON.stringify({ t: "h", n: "A320_Neo_FCU_VS_DEC", a: [], i: "a320-neo-fcu" }) });
   ws.onmessage({ data: JSON.stringify({ t: "h", n: "A320_Neo_CDU_1_BTN_B", a: [], i: null }) });
   console.log(JSON.stringify({ sent: sent, cdu: cdu.got, fcu: fcu.got, handlers: handlers.length }));
+  process.exit(0);
 }, 10);
 """
 with tempfile.TemporaryDirectory() as d:
@@ -63,7 +64,7 @@ assert r["handlers"] == 1, "hook must add exactly one extra listener"
 assert {"t": "h", "n": "A320_Neo_FCU_VS_INC", "a": [], "i": "a320-neo-fcu"} in sent, sent
 assert all(m["n"] != "SOMETHING_ELSE" for m in sent), "other panel's instrument reported here"
 assert {"t": "h", "n": "A320_Neo_CDU_1_BTN_A", "a": [], "i": None} in sent, sent
-assert any(m.get("t") == "hello" and m.get("v") == 2 for m in r["sent"])
+assert any(m.get("t") == "hello" and m.get("v") == 3 and m.get("inst") == ["a320-neo-cdu-main-display", "a320-neo-fcu"] for m in r["sent"])
 print("OK presses reported with the instrument's name, only by the panel that holds it")
 assert r["fcu"] == ["A320_Neo_FCU_VS_DEC", "A320_Neo_CDU_1_BTN_B"], r["fcu"]
 assert r["cdu"] == ["A320_Neo_CDU_1_BTN_B"], r["cdu"]

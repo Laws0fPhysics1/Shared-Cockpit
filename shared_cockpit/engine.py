@@ -137,6 +137,8 @@ class Engine:
         self.ie_last, self.ie_recent, self.ie_secs = {}, {}, {}
         self.ie_action, self.ie_noisy = set(), set()
         self.sw_recent, self.sw_pending = {}, {}
+        self.sw_secs, self.sw_noisy = {}, set()
+        self.last_click = 0.0                   # last local cockpit interaction (input event / button)
         self.ie_type, self.ie_double = {}, None
         self.exc_count = 0
 
@@ -738,13 +740,30 @@ class Engine:
                 continue
             if abs(v - prev) <= tol:
                 continue                        # didn't change locally
+            if key in self.sw_noisy or (key in sd.AP_MODE_KEYS and self.cp.screen_ap):
+                continue
             known = self.sw_known.get(key)
             if known is not None and abs(v - known) <= tol:
                 continue                        # change was us applying the peer's value
             t = net.now()
             rec = self.sw_recent.get(key)
             if rec and any(abs(v - rv) <= tol and t - rt < sd.ECHO_S for rt, rv in rec):
-                continue                        # late reading of a value the co-pilot sent
+                # Back on a value the co-pilot sent: nothing of ours to send, and any
+                # value still waiting to settle is stale now.
+                self.sw_known[key] = v
+                self.sw_pending.pop(key, None)
+                continue
+            dq = self.sw_secs.setdefault(key, deque())
+            sec = int(t)
+            if not dq or dq[-1] != sec:
+                dq.append(sec)
+            while dq and dq[0] <= sec - 10:
+                dq.popleft()
+            if len(dq) >= 8 and key not in sd.SETTLE_KEYS:
+                # e.g. pitot heat on an aircraft that switches it automatically
+                self.sw_noisy.add(key)
+                self.cp.slog.add("skip", "switch", key, v, "changes on its own - not synced this session")
+                continue
             self.sw_known[key] = v
             if key in sd.SETTLE_KEYS:
                 self.sw_pending[key] = (v, t)   # sent once the knob stops moving
@@ -764,6 +783,8 @@ class Engine:
             if not s:
                 continue
             _, var, unit, kind, arg, scale = s
+            if key in self.sw_noisy or (key in sd.AP_MODE_KEYS and self.cp.screen_ap):
+                continue
             self.sw_known[key] = v
             self.sw_pending.pop(key, None)          # the co-pilot's newer value wins
             self.sw_recent.setdefault(key, deque(maxlen=12)).append((net.now(), v))
@@ -780,6 +801,8 @@ class Engine:
                 elif kind == "onoff":
                     self.cp.note_sent(arg[0] if v >= 0.5 else arg[1])
                     self.sc.send_event(arg[0] if v >= 0.5 else arg[1])
+                elif kind == "slot":
+                    self._apply_slot(var, arg, v)
                 elif kind == "toggle":
                     if both_ie:
                         continue
@@ -790,8 +813,24 @@ class Engine:
                 self.log(f"Could not apply {key}: {e}")
                 self.cp.slog.add("fail", "switch", key, v, str(e))
 
+    def _apply_slot(self, var, arg, v):
+        """Autopilot selector in a given slot, written the way the knob's own model
+        code does it: "slot value (>K:2:EVENT)" (needs MobiFlight's module)."""
+        ev, slot = arg
+        mf = self.cp.mf
+        if hasattr(self.sc, "set_var"):              # dry-run simulator
+            self.sc.set_var(var, v)
+        elif mf is not None and getattr(mf, "ready", False):
+            mf.execute(f"{slot} {round(v)} (>K:2:{ev})")
+        elif slot == 1:                              # no MobiFlight: one-parameter fallback
+            self.cp.note_sent(ev, round(v))
+            self.sc.send_event(ev, round(v))
+        else:
+            self.cp.slog.add("skip", "switch", var, v, "needs the MobiFlight module")
+
     # ---------------------------------------------------------------- input events
     def _on_local_input_event(self, h, v):
+        self.last_click = net.now()              # any cockpit control the pilot touched
         if not (self.link and self.peer.get("ie")):
             return
         name = self.ie_by_hash.get(h)
@@ -1014,7 +1053,7 @@ class Engine:
             return
         self.cp.tick(t)
         if self.sw_pending:
-            done = {k: v for k, (v, t0) in self.sw_pending.items() if t - t0 >= sd.SETTLE_S}
+            done = {k: v for k, (v, t0) in self.sw_pending.items() if t - t0 >= sd.settle_s(k)}
             for k in done:
                 del self.sw_pending[k]
             if done and self.link:

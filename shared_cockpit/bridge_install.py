@@ -25,7 +25,7 @@ import urllib.request
 import zipfile
 
 BRIDGE_NAME = "shared-cockpit-bridge"
-BRIDGE_VERSION = "1.1.0"   # bump whenever bridge_hook.js changes: installed copies then show "update"
+BRIDGE_VERSION = "1.2.0"   # bump whenever bridge_hook.js changes: installed copies then show "update"
 DEFAULT_PORT = 50556
 MOBIFLIGHT_NAME = "mobiflight-event-module"
 MOBIFLIGHT_URL = ("https://github.com/MobiFlight/MobiFlight-WASM-Module/releases/download/"

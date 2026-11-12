@@ -146,10 +146,15 @@ SWITCHES = [
      ("FLIGHT_LEVEL_CHANGE_ON", "FLIGHT_LEVEL_CHANGE_OFF"), 1),
     ("ap_yd", "AUTOPILOT YAW DAMPER", "bool", "onoff", ("YAW_DAMPER_ON", "YAW_DAMPER_OFF"), 1),
     ("ap_fd", "AUTOPILOT FLIGHT DIRECTOR ACTIVE", "bool", "toggle", "TOGGLE_FLIGHT_DIRECTOR", 1),
-    ("ap_hdg_bug", "AUTOPILOT HEADING LOCK DIR", "degrees", "event", "HEADING_BUG_SET", 1),
-    ("ap_alt_sel", "AUTOPILOT ALTITUDE LOCK VAR", "feet", "event", "AP_ALT_VAR_SET_ENGLISH", 1),
-    ("ap_vs_sel", "AUTOPILOT VERTICAL HOLD VAR", "feet/minute", "event", "AP_VS_VAR_SET_ENGLISH", 1),
-    ("ap_spd_sel", "AUTOPILOT AIRSPEED HOLD VAR", "knots", "event", "AP_SPD_VAR_SET", 1),
+    # Autopilot selectors by SLOT: 1 = selected (most aircraft), 3 = what Airbus FCUs
+    # display. Written like the knobs' own model code does: "slot value (>K:2:EVENT)".
+    ("ap_alt_s1", "AUTOPILOT ALTITUDE LOCK VAR:1", "feet", "slot", ("AP_ALT_VAR_SET_ENGLISH", 1), 1),
+    ("ap_alt_s3", "AUTOPILOT ALTITUDE LOCK VAR:3", "feet", "slot", ("AP_ALT_VAR_SET_ENGLISH", 3), 1),
+    ("ap_hdg_s1", "AUTOPILOT HEADING LOCK DIR:1", "degrees", "slot", ("HEADING_BUG_SET", 1), 1),
+    ("ap_hdg_s3", "AUTOPILOT HEADING LOCK DIR:3", "degrees", "slot", ("HEADING_BUG_SET", 3), 1),
+    ("ap_vs_s1", "AUTOPILOT VERTICAL HOLD VAR:1", "feet/minute", "slot", ("AP_VS_VAR_SET_ENGLISH", 1), 1),
+    ("ap_vs_s3", "AUTOPILOT VERTICAL HOLD VAR:3", "feet/minute", "slot", ("AP_VS_VAR_SET_ENGLISH", 3), 1),
+    ("ap_spd_s1", "AUTOPILOT AIRSPEED HOLD VAR:1", "knots", "slot", ("AP_SPD_VAR_SET", 1), 1),
 ]
 
 # Tolerance when deciding a switch value really changed.
@@ -196,7 +201,20 @@ K_RELAY = [
 
 # Switch keys whose final value is synced only after it stops changing (the knob
 # turns themselves travel as K events); prevents fights while a knob is turning.
-SETTLE_KEYS = {"ap_hdg_bug", "ap_alt_sel", "ap_vs_sel", "ap_spd_sel", "baro", "obs1", "obs2",
+SLOT_KEYS = {"ap_alt_s1", "ap_alt_s3", "ap_hdg_s1", "ap_hdg_s3", "ap_vs_s1", "ap_vs_s3", "ap_spd_s1"}
+SETTLE_KEYS = SLOT_KEYS | {"baro", "obs1", "obs2",
                "elev_trim", "rudder_trim"}
 SETTLE_S = 0.7
+SLOT_SETTLE_S = 0.3   # selector values follow a turning knob closely
+
+
+def settle_s(key):
+    return SLOT_SETTLE_S if key in SLOT_KEYS else SETTLE_S
+
+
+# Generic autopilot MODE switches. Aircraft whose autopilot panel is a cockpit
+# screen (Airbus FCU, Boeing MCP) run these modes in their own code; pushing them
+# from outside fights that code, so they're skipped there (AP master still syncs).
+AP_MODE_KEYS = {"ap_hdg", "ap_alt", "ap_nav", "ap_apr", "ap_vs", "ap_flc", "ap_yd", "ap_fd"}
+SCREEN_AP_TAGS = ("fcu", "mcp", "autopilot", "afcs")
 ECHO_S = 2.0          # a value applied from the co-pilot within this long is never sent back

@@ -16,7 +16,7 @@ from .version import __version__
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SETTINGS = os.path.join(ROOT, "settings.json")
 DEFAULTS = {"name": "Pilot", "mode": "host", "ip": "", "port": 50555, "sim": "",
-            "sdk_prompted": []}
+            "sdk_prompted": [], "mirror_fms": True}
 
 DRY_SWITCHES = [  # (label, simvar)
     ("Gear down", "GEAR HANDLE POSITION"),
@@ -68,6 +68,7 @@ class App:
         self.root.geometry("720x700")
         self.root.minsize(580, 560)
         self.engine = Engine(self.log, self.s["name"])
+        self.engine.cp.mirror_fms = bool(self.s.get("mirror_fms", True))
         self._dry_vars = {}
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
@@ -145,6 +146,10 @@ class App:
                    ).grid(row=1, column=0, sticky="w", padx=8, pady=4)
         ttk.Label(ck, text="Loads their saved flight: position, systems, weather preset, time.",
                   foreground="#555").grid(row=1, column=1, sticky="w")
+        self.v_mirror = tk.IntVar(value=1 if self.s.get("mirror_fms", True) else 0)
+        ttk.Checkbutton(ck, text="Mirror captain and first officer FMS (a key on either goes to both)",
+                        variable=self.v_mirror, command=self._mirror_changed
+                        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 4))
 
         st = ttk.LabelFrame(fly, text="Status")
         st.pack(fill="x", **pad)
@@ -232,7 +237,7 @@ class App:
                 lambda e: self._dry_set("COM ACTIVE FREQUENCY:1", round(float(self.v_com.get()) * 1e6)))
         fms = ttk.LabelFrame(df, text="Pretend FMS (key presses sync like the real MCDU)")
         fms.grid(row=r + 1, column=0, columnspan=4, sticky="we", padx=8, pady=6)
-        self.l_scratch = tk.Label(fms, text="", font=("Consolas", 14, "bold"), width=18, anchor="w",
+        self.l_scratch = tk.Label(fms, text="", font=("Consolas", 14, "bold"), width=28, anchor="w",
                                   bg="#111", fg="#7CFC00")
         self.l_scratch.grid(row=0, column=0, columnspan=8, sticky="w", padx=6, pady=4)
         for i, k in enumerate(list("ABCDEKLS") + list("0123") + ["CLR"]):
@@ -382,6 +387,12 @@ class App:
                                "afterwards (key presses sync).\n\nLoad it now?"):
             self.engine.copy_copilot_flight()
 
+    def _mirror_changed(self):
+        on = bool(self.v_mirror.get())
+        self.engine.cp.mirror_fms = on
+        self.s["mirror_fms"] = on
+        save_settings(self.s)
+
     def _bridge_check(self, offer=False):
         if flavor.is_dry():
             self.l_bridge.configure(text="Not needed for a dry run.")
@@ -522,7 +533,7 @@ class App:
             com = "%.3f" % (sc.get("COM ACTIVE FREQUENCY:1") / 1e6)
             if self.v_com.get() != com:
                 self.v_com.set(com)
-            self.l_scratch.configure(text=sc.scratchpad or "_")
+            self.l_scratch.configure(text=f"CPT {sc.scratchpad or '_':<8} FO {sc.scratchpad2 or '_'}")
         self._tick_n = getattr(self, "_tick_n", 0) + 1
         if self._tick_n % 7 == 0:
             self._refresh_checklist()

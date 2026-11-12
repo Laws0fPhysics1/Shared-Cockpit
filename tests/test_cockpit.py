@@ -127,8 +127,8 @@ wa.send({"t": "hello", "panel": "CDU", "v": 1})
 wb.send({"t": "hello", "panel": "CDU", "v": 1})
 wait(lambda: A.cp.bridge_screens() == 1 and B.cp.bridge_screens() == 1, what="ws hello")
 wa.send({"t": "h", "n": "A320_Neo_CDU_1_BTN_EXEC", "a": [], "g": None})
-got = wb.recv()
-assert got["t"] == "h" and got["n"] == "A320_Neo_CDU_1_BTN_EXEC", got
+got = {wb.recv()["n"], wb.recv()["n"]}            # the press + its FMS mirror (on by default)
+assert got == {"A320_Neo_CDU_1_BTN_EXEC", "A320_Neo_CDU_2_BTN_EXEC"}, got
 wa.close(); wb.close()
 print("OK cockpit-screen hook on host -> WebSocket -> network -> co-pilot's screen hook")
 

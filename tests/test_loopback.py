@@ -147,19 +147,19 @@ wait(lambda: sum(1 for n, v in sb.events if n == "FREEZE_ALTITUDE_SET" and v == 
 print("OK freeze drift re-asserted")
 
 # --- switch: host lowers gear + sets COM1
-sa.push(A.REQ_SW, sw_vals({"gear": 1.0, "com1": 121_500_000.0, "ap_vs_sel": -500.0}))
+sa.push(A.REQ_SW, sw_vals({"gear": 1.0, "com1": 121_500_000.0, "ap_vs_s1": -500.0}))
 wait(lambda: ("GEAR_SET", 1) in sb.events and ("COM_RADIO_SET_HZ", 121_500_000) in sb.events
      and ("AP_VS_VAR_SET_ENGLISH", -500) in sb.events, what="switch mirror to joiner")
 # joiner sim now reports the applied values -> must NOT echo back
 n_ev_a = len(sa.events)
-sb.push(B.REQ_SW, sw_vals({"gear": 1.0, "com1": 121_500_000.0, "ap_vs_sel": -500.0}))
+sb.push(B.REQ_SW, sw_vals({"gear": 1.0, "com1": 121_500_000.0, "ap_vs_s1": -500.0}))
 time.sleep(0.3)
 assert not [e for e in sa.events[n_ev_a:] if e[0] != "FREEZE_LATITUDE_LONGITUDE_SET"
             and not e[0].startswith("FREEZE")], f"echo! {sa.events[n_ev_a:]}"
 print("OK switches: host->joiner mirrored, no echo")
 
 # --- joiner flips landing light -> host gets it
-sb.push(B.REQ_SW, sw_vals({"gear": 1.0, "com1": 121_500_000.0, "ap_vs_sel": -500.0, "lt_landing": 1.0}))
+sb.push(B.REQ_SW, sw_vals({"gear": 1.0, "com1": 121_500_000.0, "ap_vs_s1": -500.0, "lt_landing": 1.0}))
 wait(lambda: ("LANDING_LIGHTS_SET", 1) in sa.events, what="joiner->host light")
 print("OK switches: joiner->host mirrored")
 

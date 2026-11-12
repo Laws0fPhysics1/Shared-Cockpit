@@ -40,6 +40,11 @@ IE_INIT_ID0 = 95000          # request ids for the initial input-event values
 K_GROUP = 77                 # notification group for relayed key events
 K_ECHO_S = 1.0               # a K event we fired ourselves is ignored when the sim reports it
 H_QUIET_S = 0.4              # K events right after a button press are its effects: both sims make them
+CLICK_S = 0.6                # a K event is relayed only if the pilot touched a control this recently
+# Knob-turn button events: on Airbus knobs they only make the FMS re-read a value the
+# knob's model code already changed, so the VALUE is synced instead (slot sync).
+AP_KNOB_H = re.compile(r"_AP_(INC|DEC)_|^AP_KNOB_(Up|Down)$")
+FMS_PAIR = re.compile(r"^(.*?(?:CDU|MCDU|FMC|FMS)_?)([12])(_.*)$")
 H_DEDUPE = 0.06              # s: every cockpit screen reports the same press once
 NOISE_WINDOW, NOISE_SECONDS = 10, 8   # changed in 8 of the last 10 s => "changes on its own"
 TMP = os.path.join(tempfile.gettempdir(), "SharedCockpit")
@@ -83,6 +88,8 @@ class CockpitSync:
         self._ignore = _load_ignore()
         # H events
         self._h_recent = {}
+        self.instruments = set()     # cockpit instruments the bridge reported (element names)
+        self.mirror_fms = True       # a key on either FMS also goes to the other one
         # K events (autopilot knobs/buttons): relayed as causes
         self.k_by_id = {}
         self._k_sc = None
@@ -143,6 +150,7 @@ class CockpitSync:
             except Exception:
                 pass
         self.REQ_STATE = base + 7
+        self.instruments = set()     # new aircraft: its screens report again
         self.state_blk = Block(sc, base + 7, sd.state_vars(e.engines))
         self.state = None
         sc.request(self.REQ_STATE, base + 7, PERIOD_SECOND)
@@ -281,6 +289,13 @@ class CockpitSync:
             return True
         if name in self._k_noisy:
             return True
+        sc = self.e.sc
+        if (getattr(sc, "has_input_events", False) and self.e.ie_by_name
+                and now - self.e.last_click > CLICK_S):
+            # Nobody touched a control: the aircraft's own code fired it (an A320 FMS
+            # fires AP_PANEL_SPEED_HOLD on its own). Both sims do that themselves.
+            self.slog.add("skip", "k", name, data, "fired by the aircraft's own logic")
+            return True
         dq = self._k_secs.setdefault(name, deque())
         sec = int(now)
         if not dq or dq[-1] != sec:
@@ -387,9 +402,15 @@ class CockpitSync:
     # ------------------------------------------------------------------ bridge (WebSocket)
     def on_ws(self, msg, cid):
         t = msg.get("t")
-        if t == "hello":
-            self.panels[cid] = msg.get("panel") or "?"
-            self.slog.add("info", "bridge", self.panels[cid], note="cockpit screen connected")
+        if t in ("hello", "inst"):
+            if t == "hello":
+                self.panels[cid] = msg.get("panel") or "?"
+                self.slog.add("info", "bridge", self.panels[cid], note="cockpit screen connected")
+            before = self.screen_ap
+            self.instruments.update(x for x in (msg.get("inst") or []) if isinstance(x, str))
+            if self.screen_ap and not before:
+                self.slog.add("info", "bridge", note="autopilot panel is a cockpit screen: "
+                                                     "generic AP mode sync off, its own logic runs on both sims")
             return
         if t != "h":
             return
@@ -401,15 +422,43 @@ class CockpitSync:
             return                              # same press reported by another screen
         self._h_recent[n] = now
         self._h_quiet_until = now + H_QUIET_S
+        self.e.last_click = now
+        if AP_KNOB_H.search(n):
+            self.slog.add("skip", "button", n, note="knob turn: its value is synced instead")
+            return
+        twin = self._fms_twin(n)
+        if twin and self.bridge_screens():
+            self.bridge.broadcast({"t": "h", "n": twin, "a": msg.get("a") or [], "i": None})
+            self.slog.add("apply", "button", twin, note="mirrored to the other FMS")
+        elif twin and hasattr(self.e.sc, "press_h"):             # dry-run pretend cockpit
+            self.e.sc.press_h(twin)
+            self.slog.add("apply", "button", twin, note="mirrored to the other FMS (dry run)")
         if self.e.link:
             self.e._send({"t": "h", "n": n, "a": msg.get("a") or [], "i": msg.get("i")})
             self.slog.add("out", "button", n)
         else:
             self.slog.add("skip", "button", n, note="not connected")
 
+    @property
+    def screen_ap(self):
+        return any(k in t for t in self.instruments for k in sd.SCREEN_AP_TAGS)
+
+    def _fms_twin(self, n):
+        if not self.mirror_fms:
+            return None
+        m = FMS_PAIR.match(n)
+        return f"{m.group(1)}{'2' if m.group(2) == '1' else '1'}{m.group(3)}" if m else None
+
     def _replay_h(self, msg):
         n = msg.get("n")
-        self.slog.add("in", "button", n)
+        twin = self._fms_twin(n)
+        if twin:
+            self._replay_h_one(dict(msg, n=twin, i=None), note="mirrored to the other FMS")
+        self._replay_h_one(msg)
+
+    def _replay_h_one(self, msg, note=""):
+        n = msg.get("n")
+        self.slog.add("in", "button", n, note=note)
         self._h_quiet_until = net.now() + H_QUIET_S
         if self.bridge_screens():
             self.bridge.broadcast({"t": "h", "n": n, "a": msg.get("a") or [], "i": msg.get("i")})

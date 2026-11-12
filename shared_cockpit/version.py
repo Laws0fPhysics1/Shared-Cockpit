@@ -1,4 +1,4 @@
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 # GitHub repository the installer and auto-updater pull from ("owner/name").
 REPO = "Laws0fPhysics1/Shared-Cockpit"
