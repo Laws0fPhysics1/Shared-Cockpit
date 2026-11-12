@@ -115,6 +115,7 @@ class App:
         st.pack(fill="x", **pad)
         self.lbl = {}
         for i, (k, t) in enumerate([("sim", "Simulator"), ("net", "Network"), ("rtt", "Ping"),
+                                    ("motion", "Motion link"), ("env", "Weather / sim rate"),
                                     ("aircraft", "Your aircraft"), ("peer_aircraft", "Co-pilot aircraft"),
                                     ("ie", "Cockpit sync")]):
             ttk.Label(st, text=t + ":").grid(row=i, column=0, sticky="w", padx=8)

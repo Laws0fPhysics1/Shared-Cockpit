@@ -10,6 +10,7 @@ import math
 import struct
 import threading
 import time
+from collections import deque
 
 from . import syncdefs as sd
 from .simconnect import (DT_FLOAT64, DT_STRING256, FLAG_CHANGED, PERIOD_NEVER, PERIOD_ONCE,
@@ -57,7 +58,14 @@ class FakeSim:
             "NAV ACTIVE FREQUENCY:2": 110_500_000.0, "NAV STANDBY FREQUENCY:2": 113_000_000.0,
             "TRANSPONDER CODE:1": float(0x1200), "KOHLSMAN SETTING MB:1": 1013.25,
             "GEAR HANDLE POSITION": 1.0, "ELECTRICAL MASTER BATTERY": 1.0,
+            "GROUND ALTITUDE": 0.0, "SEA LEVEL PRESSURE": 1013.25, "SIMULATION RATE": 1.0,
+            "AMBIENT WIND DIRECTION": 0.0, "AMBIENT WIND VELOCITY": 0.0,
+            "FUEL TANK LEFT MAIN QUANTITY": 26.0, "FUEL TANK RIGHT MAIN QUANTITY": 26.0,
+            "PAYLOAD STATION COUNT": 2.0,
+            "PAYLOAD STATION WEIGHT:1": 170.0, "PAYLOAD STATION WEIGHT:2": 170.0,
         }
+        self.alt_base, self.alt_amp = 3000.0, 150.0   # tests can fly it low
+        self.history = deque(maxlen=4000)              # (t, lat, lon, alt, frozen) per frame
         self.defs = {}       # define_id -> [(name, dtype)]
         self.reqs = {}       # req_id -> [define_id, period, flags, interval, counter, last_payload]
         self.queue = []
@@ -91,6 +99,11 @@ class FakeSim:
         with self.lock:
             for n, v in zip(names, vals):
                 self.state[n] = v
+            s = self.state
+            if "PLANE LATITUDE" in names and s.get("IS LATITUDE LONGITUDE FREEZE ON", 0.0) >= 0.5:
+                # log where the frozen plane is actually put, at the moment it's put there
+                self.history.append((time.perf_counter(), s["PLANE LATITUDE"], s["PLANE LONGITUDE"],
+                                     s["PLANE ALTITUDE"], True))
 
     def send_event(self, name, value=0):
         if value & 0x80000000:
@@ -169,8 +182,10 @@ class FakeSim:
     def _physics(self, dt):
         with self.lock:
             s = self.state
-            if s.get("IS LATITUDE LONGITUDE FREEZE ON", 0.0) >= 0.5:
-                return
+            now = time.perf_counter()
+            frozen = s.get("IS LATITUDE LONGITUDE FREEZE ON", 0.0) >= 0.5
+            if frozen:
+                return                      # positions are logged when the engine writes them
             t = time.perf_counter() - self.t0
             hdg = (s["PLANE HEADING DEGREES TRUE"] + 3.0 * dt) % 360.0
             v = s["VELOCITY BODY Z"]
@@ -179,7 +194,12 @@ class FakeSim:
             s["PLANE LATITUDE"] = lat + v * math.cos(math.radians(hdg)) * dt / FT_PER_DEG_LAT
             s["PLANE LONGITUDE"] += (v * math.sin(math.radians(hdg)) * dt /
                                      (FT_PER_DEG_LAT * math.cos(math.radians(lat))))
-            s["PLANE ALTITUDE"] = 3000.0 + 150.0 * math.sin(t / 15.0)
+            s["PLANE ALTITUDE"] = self.alt_base + self.alt_amp * math.sin(t / 15.0)
+            s["VELOCITY WORLD X"] = v * math.sin(math.radians(hdg))
+            s["VELOCITY WORLD Z"] = v * math.cos(math.radians(hdg))
+            s["VELOCITY WORLD Y"] = self.alt_amp / 15.0 * math.cos(t / 15.0)
+            self.history.append((now, s["PLANE LATITUDE"], s["PLANE LONGITUDE"],
+                                 s["PLANE ALTITUDE"], False))
             s["PLANE BANK DEGREES"] = -25.0
             s["ROTATION VELOCITY BODY Y"] = math.radians(3.0)
             s["AILERON POSITION"] = -0.1

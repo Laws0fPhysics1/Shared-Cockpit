@@ -2,16 +2,18 @@
 
 Threads:
   sim thread   - owns SimConnect (all SimConnect calls happen here)
-  net reader   - pushes received messages into self.inbox
+  net readers  - TCP/UDP readers push received messages into self.inbox
   GUI thread   - pushes commands into self.inbox, reads self.status
 
 Model: the pilot flying (PF) runs the real flight model. The other seat's
-aircraft is frozen (lat/lon, altitude, attitude) and positioned every frame
-from PF snapshots, rendered ~DELAY seconds in the past and interpolated, so
-network jitter doesn't cause stutter.
+aircraft is frozen and placed every frame from PF snapshots. Snapshots are
+rendered slightly in the past (an adaptive jitter buffer) and interpolated
+along a curve built from the PF's real velocity (cubic Hermite), so network
+jitter and lost packets don't show.
 """
 import math
 import queue
+import secrets
 import socket
 import struct
 import threading
@@ -23,23 +25,47 @@ from .simconnect import (Block, SimConnect, SimConnectError, PERIOD_NEVER, PERIO
                          PERIOD_SIM_FRAME, PERIOD_SECOND, FLAG_CHANGED, DT_STRING256,
                          DT_FLOAT64)
 
-PROTO = 1
-DELAY = 0.10          # interpolation delay (s); raise if motion stutters on bad links
-MAX_EXTRAP = 0.25     # max extrapolation past newest snapshot (s)
-SEND_HZ = 40.0        # PF motion packets per second
-APPLY_HZ = 60.0       # fallback placement rate when own sim frames aren't arriving
+PROTO = 2
+SEND_HZ = 40.0          # PF motion packets per second
+BUF_START, BUF_MIN, BUF_MAX = 0.12, 0.035, 0.60   # total playback delay behind the PF (s)
+MAX_EXTRAP = 0.30       # max prediction past the newest snapshot (s)
+APPLY_HZ = 60.0         # fallback placement rate when own sim frames aren't arriving
+HANDOFF_RAMP = 2.0      # s to ease from "live" to buffered playback after giving controls
+CATCHUP = 1.2           # s the taker spends fast-forwarding to "live" before taking over
+GROUND_TOP, GROUND_FULL = 100.0, 40.0   # ft AGL: blend to local-terrain altitude below these
+FT_PER_DEG = 364566.0   # feet per degree of latitude
 
 EV_AIRCRAFT_LOADED, EV_SIM_START, EV_FLIGHT_LOADED = 1, 2, 3
 DEF_INFO, REQ_INFO, REQ_ENUM_IE = 1, 1, 2
 
 
-def _lerp_angle(a, b, f):
-    d = (b - a + 180.0) % 360.0 - 180.0
-    return a + d * f
-
-
 def _wrap180(x):
     return (x + 180.0) % 360.0 - 180.0
+
+
+def _lerp_angle(a, b, f):
+    return a + _wrap180(b - a) * f
+
+
+def _hermite(p0, m0, p1, m1, h, f):
+    f2, f3 = f * f, f * f * f
+    return ((2 * f3 - 3 * f2 + 1) * p0 + (f3 - 2 * f2 + f) * h * m0 +
+            (-2 * f3 + 3 * f2) * p1 + (f3 - f2) * h * m1)
+
+
+class Snap:
+    __slots__ = ("ts", "m", "c", "v", "g")
+
+    def __init__(self, ts, m, c, v, g):
+        self.ts, self.m, self.c, self.v, self.g = ts, m, c, v, g
+
+    def rates(self):
+        """d(lat)/dt, d(lon)/dt in deg/s and d(alt)/dt in ft/s, or None."""
+        if not self.v:
+            return None
+        ve, vu, vn = self.v
+        coslat = max(math.cos(math.radians(self.m[sd.M_LAT])), 1e-6)
+        return vn / FT_PER_DEG, ve / (FT_PER_DEG * coslat), vu
 
 
 class Engine:
@@ -52,9 +78,9 @@ class Engine:
         self.sc = None
         self.ready = False
         self.gen = 0                 # data-definition generation (rebuilt per aircraft)
-        self.title = ""
-        self.model = ""
+        self.title = self.model = ""
         self.engines = 1
+        self.payload_n = 0
 
         self.role = None             # "host" | "join"
         self.link = None
@@ -64,18 +90,38 @@ class Engine:
         self.ctl_epoch = 0
         self._frozen = False
         self._last_freeze = 0.0
-
-        self.snaps = deque(maxlen=120)
-        self._offsets = deque()
-        self._offset = None
-        self._last_send = 0.0
-        self._last_apply = 0.0
-        self._last_frame = 0.0
         self._frz_state = None
-        self.ie_type, self.ie_double = {}, None
-        self._latest_ctrl = None
-        self._last_ping = 0.0
+
+        # UDP motion channel
+        self.udp = None
+        self.udp_peer = None         # where to send UDP
+        self.udp_token = secrets.token_hex(6)   # peers must echo this to be accepted
+        self.udp_token_peer = None
+        self._udp_last_rx = 0.0
+        self._udp_tx_ok = False
+        self._last_uh = self._last_uok = 0.0
+        self._conn_t = 0.0
+        self._udp_hinted = False
+
+        # timing / interpolation
+        self.snaps = deque(maxlen=160)
+        self._offsets = deque()      # (t_local, local_recv - remote_send): fallback clock estimate
+        self._offset = None
+        self._clk = deque()          # (t_local, rtt, clock difference) from ping/pong, NTP-style
+        self._ages = deque()         # (t_local, age of each motion packet on arrival)
+        self.buf = BUF_START
         self.rtt = None
+        self._ramp_t0 = None
+        self._catchup_t0 = None
+        self._latest_motion = None
+        self.last_rt = None
+        self._last_send = self._last_apply = self._last_frame = self._last_ping = 0.0
+
+        self._latest_ctrl = self._latest_aux = self._env = None
+        self.peer_env = None
+        self._last_env_send = 0.0
+        self._warned = {}
+        self.load_blocks = {}
 
         self.sw_prev = {}            # last local reading per switch
         self.sw_known = {}           # last agreed value per switch
@@ -83,10 +129,11 @@ class Engine:
         self.sw_set_blocks = {}
 
         self.ie_by_hash, self.ie_by_name, self.ie_applied = {}, {}, {}
+        self.ie_type, self.ie_double = {}, None
         self.exc_count = 0
 
         self.status = {"sim": "Not connected", "net": "Idle", "pf": "", "aircraft": "",
-                       "peer_aircraft": "", "rtt": "", "ie": ""}
+                       "peer_aircraft": "", "rtt": "", "ie": "", "motion": "", "env": ""}
         threading.Thread(target=self._sim_loop, daemon=True).start()
 
     # ================================================================ public (GUI thread)
@@ -94,8 +141,13 @@ class Engine:
         self.stop_net()
         self.role = "host"
         self.hostsrv = net.Host(port, self._on_sock, self.log)
+        try:
+            self.udp = net.Udp(port, self._on_udp)
+        except OSError as e:
+            self.udp = None
+            self.log(f"UDP port {port} unavailable ({e}); motion will use TCP.")
         self.status["net"] = f"Hosting on port {port}, waiting for co-pilot..."
-        self.log(f"Hosting on TCP port {port}. Your friend joins with your public IP and this port.")
+        self.log(f"Hosting on port {port} (TCP + UDP). Your friend joins with your public IP and this port.")
         self.inbox.put(("cmd", "set_pf", "host"))
 
     def join(self, ip, port):
@@ -106,10 +158,16 @@ class Engine:
         def go():
             try:
                 s = net.connect(ip, port)
+                addr = socket.gethostbyname(ip)
             except (OSError, socket.timeout) as e:
                 self.status["net"] = "Connect failed"
                 self.log(f"Could not connect to {ip}:{port}: {e}")
                 return
+            try:
+                self.udp = net.Udp(0, self._on_udp)
+                self.udp_peer = (addr, port)
+            except OSError as e:
+                self.log(f"UDP unavailable ({e}); motion will use TCP.")
             self.log(f"Connected to {ip}:{port}")
             self._on_sock(s)
         threading.Thread(target=go, daemon=True).start()
@@ -120,6 +178,9 @@ class Engine:
         if self.hostsrv:
             self.hostsrv.stop()
             self.hostsrv = None
+        if self.udp:
+            self.udp.close()
+            self.udp = None
         self.role = None
         self.status["net"] = "Idle"
 
@@ -140,26 +201,48 @@ class Engine:
     def _on_sock(self, sock):
         if self.hostsrv:
             self.hostsrv.busy = True
+        self.udp_token = secrets.token_hex(6)
+        self.udp_token_peer = None
+        self._udp_tx_ok = False
+        self._udp_last_rx = 0.0
+        self._udp_hinted = False
+        self._conn_t = net.now()
         self.link = net.Link(sock, lambda m: self.inbox.put(("net", m)), self._on_close)
         self.status["net"] = "Connected"
         self._send({"t": "hello", "v": PROTO, "name": self.name, "title": self.title,
-                    "model": self.model, "sim": flavor.SIM,
-                    "role": self.role, "ie": bool(self.sc and self.sc.has_input_events)})
+                    "model": self.model, "sim": flavor.SIM, "role": self.role,
+                    "uk": self.udp_token, "ie": bool(self.sc and self.sc.has_input_events)})
 
     def _on_close(self, reason):
         self.log(f"Link closed: {reason}")
         self.link = None
         if self.hostsrv:
             self.hostsrv.busy = False
+            self.udp_peer = None           # next joiner announces its own address
             self.status["net"] = "Co-pilot left. Waiting for co-pilot..."
         else:
             self.status["net"] = "Disconnected"
+            if self.udp:
+                self.udp.close()
+                self.udp = None
+        self._udp_tx_ok = False
+        self.status["motion"] = ""
         self.peer = {}
         self.inbox.put(("cmd", "disconnected"))
+
+    def _on_udp(self, msg, addr):
+        self.inbox.put(("udp", msg, addr))
 
     def _send(self, msg):
         if self.link:
             self.link.send(msg)
+
+    def _send_motion(self, msg):
+        if self.udp and self.udp_peer and self._udp_tx_ok and self.udp_token_peer:
+            msg["k"] = self.udp_token_peer
+            self.udp.send(msg, self.udp_peer)
+        else:
+            self._send(msg)
 
     # ================================================================ sim thread
     def _sim_loop(self):
@@ -199,8 +282,9 @@ class Engine:
             try:
                 item = self.inbox.get_nowait()
             except queue.Empty:
-                return
+                break
             self._on_inbox(item)
+        self._net_tick(net.now())
 
     def _try_connect(self):
         try:
@@ -227,6 +311,7 @@ class Engine:
         sc.add_def(DEF_INFO, "TITLE", None, DT_STRING256)
         sc.add_def(DEF_INFO, "NUMBER OF ENGINES", "number", DT_FLOAT64)
         sc.add_def(DEF_INFO, "ATC MODEL", None, DT_STRING256)
+        sc.add_def(DEF_INFO, "PAYLOAD STATION COUNT", "number", DT_FLOAT64)
         sc.subscribe_system(EV_AIRCRAFT_LOADED, "AircraftLoaded")
         sc.subscribe_system(EV_SIM_START, "SimStart")
         sc.subscribe_system(EV_FLIGHT_LOADED, "FlightLoaded")
@@ -247,21 +332,27 @@ class Engine:
         sc = self.sc
         if self.ready:  # stop previous generation's requests
             base = self.gen * 100
-            for r in (base + 1, base + 2, base + 3, base + 4):
+            for r in range(base + 1, base + 7):
                 try:
                     sc.request(r, r, PERIOD_NEVER)
                 except SimConnectError:
                     pass
         self.gen += 1
         base = self.gen * 100
-        self.REQ_MOTION, self.REQ_CTRL, self.REQ_SW, self.REQ_FRZ = base + 1, base + 2, base + 3, base + 4
+        (self.REQ_MOTION, self.REQ_CTRL, self.REQ_SW, self.REQ_FRZ, self.REQ_AUX,
+         self.REQ_ENV) = range(base + 1, base + 7)
         self.motion = Block(sc, base + 1, sd.MOTION)
         self.ctrl = Block(sc, base + 2, sd.controls(self.engines))
         self.sw = Block(sc, base + 3, [(s[1], s[2]) for s in sd.SWITCHES])
         self.frz = Block(sc, base + 4, [("IS LATITUDE LONGITUDE FREEZE ON", "bool"),
                                         ("IS ALTITUDE FREEZE ON", "bool"),
                                         ("IS ATTITUDE FREEZE ON", "bool")])
-        self._frz_state = None
+        self.aux = Block(sc, base + 5, sd.AUX)
+        self.load_vars = sd.load_vars(self.payload_n)
+        self.env = Block(sc, base + 6, sd.ENV + self.load_vars)
+        self.load_blocks = {}
+        self._load_did = base + 60
+        self._frz_state = self._latest_aux = self._env = None
         self.sw_set_blocks = {}
         did = base + 10
         for s in sd.SWITCHES:
@@ -272,6 +363,8 @@ class Engine:
         sc.request(self.REQ_CTRL, base + 2, PERIOD_SIM_FRAME)
         sc.request(self.REQ_SW, base + 3, PERIOD_SIM_FRAME, FLAG_CHANGED, interval=2)
         sc.request(self.REQ_FRZ, base + 4, PERIOD_SECOND)
+        sc.request(self.REQ_AUX, base + 5, PERIOD_SIM_FRAME)
+        sc.request(self.REQ_ENV, base + 6, PERIOD_SECOND)
         self.sw_prev = {}
         self._latest_ctrl = None
         self.ready = True
@@ -296,6 +389,8 @@ class Engine:
                 # ATC MODEL identifies the aircraft type independent of livery
                 # (in MSFS 2020 TITLE includes the livery name).
                 self.model = raw[264:520].split(b"\0", 1)[0].decode("utf-8", "replace")
+                self.payload_n = int(struct.unpack_from("<d", raw, 520)[0] + 0.5) \
+                    if len(raw) >= 528 else 0
                 self.status["aircraft"] = self.title
                 self.log(f"Aircraft: {self.title} ({self.engines} engine(s))")
                 self._build()
@@ -305,12 +400,16 @@ class Engine:
                 return
             elif req == self.REQ_MOTION:
                 self._on_motion(self.motion.unpack(raw))
+            elif req == self.REQ_AUX:
+                self._latest_aux = self.aux.unpack(raw)
             elif req == self.REQ_CTRL:
                 self._latest_ctrl = self.ctrl.unpack(raw)
             elif req == self.REQ_SW:
                 self._on_switches(self.sw.unpack(raw))
             elif req == self.REQ_FRZ:
                 self._frz_state = self.frz.unpack(raw)
+            elif req == self.REQ_ENV:
+                self._env = self.env.unpack(raw)
         elif kind == "event":
             if m[1] in (EV_AIRCRAFT_LOADED, EV_FLIGHT_LOADED, EV_SIM_START):
                 self.sc.request(REQ_INFO, DEF_INFO, PERIOD_ONCE)
@@ -349,14 +448,60 @@ class Engine:
             self.log(f"WARNING: aircraft differ! You: '{self.title}'  Co-pilot: '{pt}'. "
                      "Load the exact same aircraft/livery for switches to line up.")
 
+    # ---------------------------------------------------------------- clock / buffer
+    def _add_offset_sample(self, t_local, sample):
+        self._offsets.append((t_local, sample))
+        while self._offsets and t_local - self._offsets[0][0] > 5.0:
+            self._offsets.popleft()
+        self._offset = min(s for _, s in self._offsets)
+
+    def _clock_diff(self):
+        """Our clock minus the co-pilot's clock (s), or None if unknown yet.
+
+        Best: the ping/pong sample with the lowest round trip in the last 10 s
+        (NTP midpoint method, accurate to ~half the round-trip asymmetry).
+        Fallback before the first pong: fastest motion packet (assumes ~0 latency)."""
+        if self._clk:
+            return min(self._clk, key=lambda c: c[1])[2]
+        return self._offset
+
+    def _remote_now(self):
+        d = self._clock_diff()
+        return None if d is None else net.now() - d
+
+    def _update_buffer(self, t_local, ts):
+        """Adaptive playback delay: cover the 95th-percentile packet age + send spacing."""
+        d = self._clock_diff()
+        if d is None:
+            return
+        self._ages.append((t_local, t_local - d - ts))
+        while self._ages and t_local - self._ages[0][0] > 5.0:
+            self._ages.popleft()
+        ages = sorted(a for _, a in self._ages)
+        p95 = ages[min(len(ages) - 1, int(len(ages) * 0.95))]
+        target = min(max(1.25 / SEND_HZ + p95 + 0.005, BUF_MIN), BUF_MAX)
+        # grow fast when the link gets worse, shrink slowly when it improves
+        self.buf += (target - self.buf) * (0.25 if target > self.buf else 0.01)
+        self.status["motion"] = self._motion_status()
+
+    def _motion_status(self):
+        path = "UDP" if self._udp_tx_ok else "TCP"
+        rx = "UDP" if net.now() - self._udp_last_rx < 2.5 else "TCP"
+        return f"send {path} / receive {rx}, showing co-pilot {self.buf * 1000:.0f} ms behind"
+
     # ---------------------------------------------------------------- motion
     def _on_motion(self, vals):
         t = net.now()
+        self._latest_motion, self._latest_motion_t = vals, t
         if self._is_slave():
             # Our own sim frame ticked: place the frozen aircraft now, in step
             # with the sim's frame loop (less jitter than a free-running timer).
-            self._last_frame = t
-            self._last_apply = t
+            self._last_frame = self._last_apply = t
+            if self._catchup_t0 is not None and t - self._catchup_t0 >= CATCHUP:
+                # Take over exactly on a sim frame, so the sim integrates on from the
+                # position we hand it rather than from a mid-frame write.
+                self._finish_take()
+                return
             self._apply_motion()
             return
         if not (self.link and self.pf == self.role):
@@ -364,40 +509,59 @@ class Engine:
         if t - self._last_send < 1.0 / SEND_HZ:
             return
         self._last_send = t
-        m = [round(v, 9) if i < 2 else round(v, 5) for i, v in enumerate(vals)]
-        c = [round(v, 4) for v in self._latest_ctrl] if self._latest_ctrl else None
-        self._send({"t": "mo", "ts": t, "m": m, "c": c})
+        msg = {"t": "mo", "ts": t,
+               "m": [round(v, 9) if i < 2 else round(v, 5) for i, v in enumerate(vals)],
+               "c": [round(v, 4) for v in self._latest_ctrl] if self._latest_ctrl else None}
+        a = self._latest_aux
+        if a:
+            msg["v"] = [round(a[sd.A_VE], 3), round(a[sd.A_VU], 3), round(a[sd.A_VN], 3)]
+            msg["g"] = round(a[sd.A_GROUND], 2)
+        self._send_motion(msg)
 
     def _on_remote_motion(self, msg):
         t_local = net.now()
         sample = t_local - msg["ts"]
-        self._offsets.append((t_local, sample))
-        while self._offsets and t_local - self._offsets[0][0] > 3.0:
-            self._offsets.popleft()
-        self._offset = min(s for _, s in self._offsets)
-        if self.snaps and msg["ts"] <= self.snaps[-1][0]:
-            return
-        self.snaps.append((msg["ts"], msg["m"], msg.get("c")))
+        self._add_offset_sample(t_local, sample)
+        self._update_buffer(t_local, msg["ts"])
+        if self.snaps and msg["ts"] <= self.snaps[-1].ts:
+            return                                   # late/duplicate UDP packet
+        self.snaps.append(Snap(msg["ts"], msg["m"], msg.get("c"), msg.get("v"), msg.get("g")))
 
     def _sample(self, rt):
-        """Interpolated motion vector at sender-time rt."""
+        """Motion vector, controls and remote ground elevation at sender-time rt."""
         s = self.snaps
-        if rt <= s[0][0]:
-            return list(s[0][1]), s[0][2]
-        if len(s) == 1:
-            return list(s[-1][1]), s[-1][2]
-        if rt >= s[-1][0]:
-            a, b = s[-2], s[-1]
-            f = min(rt - b[0], MAX_EXTRAP) / max(b[0] - a[0], 1e-3)
-            f = 1.0 + f
-        else:
-            i = len(s) - 1
-            while s[i - 1][0] > rt:
-                i -= 1
-            a, b = s[i - 1], s[i]
-            f = (rt - a[0]) / max(b[0] - a[0], 1e-6)
+        first, last = s[0], s[-1]
+        if rt <= first.ts:
+            return list(first.m), first.c, first.g
+        if rt >= last.ts:                            # predict past the newest snapshot
+            dt = min(rt - last.ts, MAX_EXTRAP)
+            out = list(last.m)
+            r = last.rates()
+            prev = s[-2] if len(s) > 1 else None
+            if r:
+                out[sd.M_LAT] += r[0] * dt
+                out[sd.M_LON] = _wrap180(out[sd.M_LON] + r[1] * dt)
+                out[sd.M_ALT] += r[2] * dt
+            elif prev:
+                h = max(last.ts - prev.ts, 1e-3)
+                for k in (sd.M_LAT, sd.M_ALT):
+                    out[k] += (last.m[k] - prev.m[k]) / h * dt
+                out[sd.M_LON] = _wrap180(out[sd.M_LON] + _wrap180(last.m[sd.M_LON] - prev.m[sd.M_LON]) / h * dt)
+            if prev:
+                h = max(last.ts - prev.ts, 1e-3)
+                for k in sd.ANGLE_IDX:
+                    out[k] = out[k] + _wrap180(last.m[k] - prev.m[k]) / h * dt
+                out[sd.M_HDG] %= 360.0
+                out[sd.M_BANK] = _wrap180(out[sd.M_BANK])
+            return out, last.c, last.g
+        i = len(s) - 1
+        while s[i - 1].ts > rt:
+            i -= 1
+        a, b = s[i - 1], s[i]
+        h = max(b.ts - a.ts, 1e-6)
+        f = (rt - a.ts) / h
         out = []
-        for k, (x, y) in enumerate(zip(a[1], b[1])):
+        for k, (x, y) in enumerate(zip(a.m, b.m)):
             if k == sd.M_LON or k in sd.ANGLE_IDX:
                 v = _lerp_angle(x, y, f)
                 if k == sd.M_HDG:
@@ -407,18 +571,52 @@ class Engine:
                 out.append(v)
             else:
                 out.append(x + (y - x) * f)
-        return out, b[2]
+        ra, rb = a.rates(), b.rates()
+        if ra and rb:                                # curved path through both snapshots
+            out[sd.M_LAT] = _hermite(a.m[sd.M_LAT], ra[0], b.m[sd.M_LAT], rb[0], h, f)
+            lon_b = a.m[sd.M_LON] + _wrap180(b.m[sd.M_LON] - a.m[sd.M_LON])
+            out[sd.M_LON] = _wrap180(_hermite(a.m[sd.M_LON], ra[1], lon_b, rb[1], h, f))
+            out[sd.M_ALT] = _hermite(a.m[sd.M_ALT], ra[2], b.m[sd.M_ALT], rb[2], h, f)
+        g = a.g + (b.g - a.g) * f if a.g is not None and b.g is not None else b.g
+        return out, b.c, g
+
+    def _render_time(self):
+        """Co-pilot-clock time to show: buffered, or easing to/from 'live' around a handoff."""
+        delay = self.buf
+        if self._catchup_t0 is not None:          # taking over: ease to live
+            delay *= 1.0 - min((net.now() - self._catchup_t0) / CATCHUP, 1.0)
+        elif self._ramp_t0 is not None:           # just gave controls: ease from live
+            k = (net.now() - self._ramp_t0) / HANDOFF_RAMP
+            if k >= 1.0:
+                self._ramp_t0 = None
+            else:
+                delay *= k
+        return self._remote_now() - delay
 
     def _apply_motion(self):
-        if not self.snaps or self._offset is None:
+        if not self.snaps or self._clock_diff() is None:
             return
-        rt = net.now() - self._offset - DELAY
-        vals, ctrl = self._sample(rt)
+        rt = self._render_time()
+        self.last_rt = rt
+        vals, ctrl, g_remote = self._sample(rt)
+        self._ground_blend(vals, g_remote)
         self.motion.write(vals)
         if ctrl and len(ctrl) == len(self.ctrl.vars):
             self.ctrl.write(ctrl)
-        while len(self.snaps) > 2 and self.snaps[1][0] < rt - 1.0:
+        while len(self.snaps) > 3 and self.snaps[1].ts < rt - 1.0:
             self.snaps.popleft()
+
+    def _ground_blend(self, vals, g_remote):
+        """Near the ground, keep the remote height above ground on OUR terrain,
+        so differing scenery elevations can't sink or float the wheels."""
+        a = self._latest_aux
+        if g_remote is None or not a:
+            return
+        agl = vals[sd.M_ALT] - g_remote
+        if agl >= GROUND_TOP:
+            return
+        w = min(max((GROUND_TOP - agl) / (GROUND_TOP - GROUND_FULL), 0.0), 1.0)
+        vals[sd.M_ALT] = vals[sd.M_ALT] * (1 - w) + (a[sd.A_GROUND] + agl) * w
 
     def _set_freeze(self, on):
         if not (self.sc and self.ready):
@@ -428,6 +626,55 @@ class Engine:
             self.sc.send_event(ev, v)
         self._frozen = on
         self._last_freeze = net.now()
+
+    # ---------------------------------------------------------------- fuel / weather
+    def _env_message(self):
+        e = self._env
+        n = len(sd.ENV)
+        return {"t": "env", "w": [round(e[0], 1), round(e[1], 1)], "p": round(e[2], 2),
+                "r": round(e[3], 3), "l": [round(x, 3) for x in e[n:]]}
+
+    def _check_env(self):
+        e, p = self._env, self.peer_env
+        if not (e and p):
+            return
+        issues = []
+        wd, wv = e[0], e[1]
+        pd, pv = p["w"]
+        if abs(wv - pv) > 8 or (max(wv, pv) > 5 and abs(_wrap180(wd - pd)) > 30):
+            issues.append(f"wind (you {wd:03.0f}/{wv:.0f} kt, co-pilot {pd:03.0f}/{pv:.0f} kt)")
+        if abs(e[2] - p["p"]) > 2.0:
+            issues.append(f"pressure (you {e[2]:.0f} hPa, co-pilot {p['p']:.0f} hPa)")
+        if abs(e[3] - p["r"]) > 0.01:
+            issues.append(f"sim rate (you {e[3]:g}x, co-pilot {p['r']:g}x)")
+        self.status["env"] = "matched" if not issues else "differs: " + ", ".join(i.split(" (")[0] for i in issues)
+        t = net.now()
+        for i in issues:
+            key = i.split(" (")[0]
+            if t - self._warned.get(key, -1e9) > 60:
+                self._warned[key] = t
+                self.log(f"Weather/sim differs from co-pilot: {i}. Pick the same weather preset "
+                         "(not live weather) and sim rate for smooth control handoffs.")
+
+    def _apply_peer_load(self):
+        """When taking the controls, copy the previous pilot's fuel & payload."""
+        p, e = self.peer_env, self._env
+        if not (p and e and self.ready) or len(p["l"]) != len(self.load_vars):
+            return
+        n = len(sd.ENV)
+        changed = 0
+        for i, ((var, unit), remote) in enumerate(zip(self.load_vars, p["l"])):
+            local = e[n + i]
+            if abs(remote - local) < 0.05 or (remote < 0.01 and local < 0.01):
+                continue
+            blk = self.load_blocks.get(var)
+            if blk is None:
+                blk = self.load_blocks[var] = Block(self.sc, self._load_did, [(var, unit)])
+                self._load_did += 1
+            blk.write([remote])
+            changed += 1
+        if changed:
+            self.log(f"Copied fuel/payload from co-pilot ({changed} values).")
 
     # ---------------------------------------------------------------- switches
     def _on_switches(self, vals):
@@ -505,18 +752,51 @@ class Engine:
 
     # ---------------------------------------------------------------- control ownership
     def _set_pf(self, pf, announce=False):
+        was_slave = self._is_slave()
+        was_pf = self.link is not None and self.pf == self.role
         self.pf = pf
+        me = self.i_have_controls()
+        if was_slave and me and self.ready and self.snaps and self._clock_diff() is not None:
+            # Seamless takeover: start from where the plane is NOW on the other PC
+            # (predicted forward past the network delay), not where we were showing it.
+            vals, ctrl, g = self._sample(self._remote_now())
+            self._ground_blend(vals, g)
+            self.motion.write(vals)
+            self._apply_peer_load()
+        # Gave the controls away: start showing the new PF "live" (no lag jump-back),
+        # then ease into normal buffered playback over HANDOFF_RAMP seconds.
+        self._ramp_t0 = net.now() if (was_pf and not me) else None
+        self._catchup_t0 = None
         self.snaps.clear()
-        self._offsets.clear()
-        self._offset = None
+        if self._ramp_t0 is not None and self._clock_diff() is not None and self._latest_motion:
+            # Seed the follow buffer with our own last state (in the new PF's clock) so the
+            # plane keeps gliding along its velocity until their first packets arrive.
+            a = self._latest_aux
+            self.snaps.append(Snap(
+                self._latest_motion_t - self._clock_diff(), list(self._latest_motion),
+                self._latest_ctrl,
+                [a[sd.A_VE], a[sd.A_VU], a[sd.A_VN]] if a else None,
+                a[sd.A_GROUND] if a else None))
         if announce:
             self._send({"t": "ctl", "e": self.ctl_epoch, "pf": pf})
-        me = self.i_have_controls()
         self.status["pf"] = "YOU have the controls" if me else "CO-PILOT has the controls"
         if self.link:
             self.log("You have the controls." if me else "Co-pilot has the controls - hands off, "
                      "your aircraft now follows theirs.")
         self._set_freeze(not me)
+
+    def _begin_take(self):
+        if not self.link or self.pf == self.role or self._catchup_t0 is not None:
+            return
+        if self._is_slave() and self.snaps and self._clock_diff() is not None and self.ready:
+            self._catchup_t0 = net.now()          # fast-forward to "live", then take (in _tick)
+        else:
+            self._finish_take()
+
+    def _finish_take(self):
+        self._catchup_t0 = None
+        self.ctl_epoch += 1
+        self._set_pf(self.role, announce=True)
 
     # ---------------------------------------------------------------- inbox
     def _on_inbox(self, item):
@@ -525,15 +805,23 @@ class Engine:
             if c == "set_pf":
                 self._set_pf(item[2])
             elif c == "take":
-                if self.link and self.pf != self.role:
-                    self.ctl_epoch += 1
-                    self._set_pf(self.role, announce=True)
+                self._begin_take()
             elif c == "give":
                 if self.link and self.pf == self.role:
-                    self.ctl_epoch += 1
-                    self._set_pf("join" if self.role == "host" else "host", announce=True)
+                    self._send({"t": "give"})     # the co-pilot runs the smooth take path
+                    self.log("Offering the controls to your co-pilot...")
             elif c == "disconnected":
                 self._set_pf(self.role or "host")
+            return
+        if item[0] == "udp":
+            msg, addr = item[1], item[2]
+            if not self.link or msg.get("k") != self.udp_token:
+                return                                # stray or stale packet
+            self._udp_last_rx = net.now()
+            if self.role == "host":
+                self.udp_peer = addr                  # reply to wherever the joiner's NAT maps
+            if msg.get("t") == "mo" and self.pf != self.role:
+                self._on_remote_motion(msg)
             return
         msg = item[1]
         t = msg.get("t")
@@ -552,14 +840,27 @@ class Engine:
             if e > self.ctl_epoch or (e == self.ctl_epoch and self.role == "join"):
                 self.ctl_epoch = e
                 self._set_pf(msg["pf"])
+        elif t == "give":
+            self.log("Co-pilot is giving you the controls.")
+            self._begin_take()
+        elif t == "env":
+            self.peer_env = msg
+            self._check_env()
+        elif t == "uok":
+            was = self._udp_tx_ok
+            self._udp_tx_ok = bool(msg.get("rx"))
+            if self._udp_tx_ok != was:
+                self.log("Motion now goes over UDP (fastest)." if self._udp_tx_ok else
+                         "UDP stopped getting through; motion falls back to TCP.")
         elif t == "hello":
             self.peer = msg
+            self.udp_token_peer = msg.get("uk")
             self.log(f"Co-pilot '{msg.get('name')}' says hello (aircraft: {msg.get('title') or '?'}).")
             if msg.get("sim") and msg["sim"] != flavor.SIM:
                 self.log(f"Note: co-pilot is on {msg['sim']}, you're on {flavor.SIM}. Cross-version "
                          "flying is untested; aircraft names won't match and some switches may not sync.")
             if msg.get("v") != PROTO:
-                self.log("WARNING: co-pilot runs a different Shared Cockpit version.")
+                self.log("WARNING: co-pilot runs a different Shared Cockpit version - both should update.")
             self._check_titles()
             if self.role == "host":
                 # Host is authoritative on connect: who flies + full switch state.
@@ -572,22 +873,49 @@ class Engine:
             if self.role == "host":
                 self._send({"t": "swfull", "s": dict(self.sw_prev)})
         elif t == "ping":
-            self._send({"t": "pong", "x": msg["x"]})
+            self._send({"t": "pong", "x": msg["x"], "y": net.now()})
         elif t == "pong":
-            self.rtt = (net.now() - msg["x"]) * 1000.0
+            t1 = net.now()
+            self.rtt = (t1 - msg["x"]) * 1000.0
             self.status["rtt"] = f"{self.rtt:.0f} ms"
+            if "y" in msg:   # NTP-style: midpoint of our send/receive vs their reply time
+                self._clk.append((t1, t1 - msg["x"], (msg["x"] + t1) / 2.0 - msg["y"]))
+                while self._clk and t1 - self._clk[0][0] > 10.0:
+                    self._clk.popleft()
 
     # ---------------------------------------------------------------- periodic
     def _is_slave(self):
         return self.link is not None and self.pf is not None and self.pf != self.role
 
-    def _tick(self):
-        t = net.now()
-        if self.link and t - self._last_ping > 2.0:
+    def _net_tick(self, t):
+        if not self.link:
+            return
+        if t - self._last_ping > 1.0:
             self._last_ping = t
             self._send({"t": "ping", "x": t})
+        if self.udp and self.udp_peer and self.udp_token_peer and t - self._last_uh > 0.5:
+            self._last_uh = t                 # keeps NAT mappings open + proves UDP works
+            self.udp.send({"t": "uh", "k": self.udp_token_peer}, self.udp_peer)
+        if t - self._last_uok > 1.0:
+            self._last_uok = t
+            self._send({"t": "uok", "rx": t - self._udp_last_rx < 2.5})
+            self.status["motion"] = self._motion_status()
+        if (not self._udp_hinted and t - self._conn_t > 8.0 and not self._udp_tx_ok
+                and t - self._udp_last_rx > 8.0):
+            self._udp_hinted = True
+            port = self.udp_peer[1] if self.role == "join" and self.udp_peer else "your"
+            self.log(f"UDP isn't getting through, so motion uses TCP (works, slightly less smooth). "
+                     f"Host: also forward UDP port {port} on your router.")
+
+    def _tick(self):
+        t = net.now()
+        self._net_tick(t)
         if not self.ready:
             return
+        if self.link and self._env and t - self._last_env_send > 2.0:
+            self._last_env_send = t
+            self._send(self._env_message())
+            self._check_env()
         slave = self._is_slave()
         fs = self._frz_state
         if fs is not None:
@@ -595,9 +923,16 @@ class Engine:
             drift = any((v >= 0.5) != slave for v in fs)
         else:
             drift = slave and t - self._last_freeze > 3.0
-        if self._frozen is None or (self._frozen and not slave) or                 (drift and t - self._last_freeze > 1.0):
+        if (self._frozen is None or (self._frozen and not slave) or
+                (drift and t - self._last_freeze > 1.0)):
             self._set_freeze(slave)
             self._frz_state = None
+        if self._catchup_t0 is not None and t - self._catchup_t0 >= CATCHUP + 0.25:
+            # No sim frame arrived to finish on (paused?) - finish anyway.
+            if self._is_slave():
+                self._finish_take()
+            else:
+                self._catchup_t0 = None
         # Fallback placement if our own sim frames aren't arriving (e.g. paused).
         if slave and t - self._last_frame > 0.1 and t - self._last_apply >= 1.0 / APPLY_HZ:
             self._last_apply = t

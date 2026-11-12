@@ -31,6 +31,33 @@ M_LAT, M_LON, M_ALT, M_PITCH, M_BANK, M_HDG = range(6)
 ANGLE_IDX = (M_PITCH, M_BANK, M_HDG)
 
 
+# Read-only, every frame: world velocity (for curved interpolation) + ground elevation.
+AUX = [
+    ("VELOCITY WORLD X", "feet per second"),   # east
+    ("VELOCITY WORLD Y", "feet per second"),   # up
+    ("VELOCITY WORLD Z", "feet per second"),   # north
+    ("GROUND ALTITUDE", "feet"),
+]
+A_VE, A_VU, A_VN, A_GROUND = range(4)
+
+# Once a second: weather/sim-rate (mismatch warnings) + fuel/payload (copied at handoff).
+ENV = [
+    ("AMBIENT WIND DIRECTION", "degrees"),
+    ("AMBIENT WIND VELOCITY", "knots"),
+    ("SEA LEVEL PRESSURE", "millibars"),
+    ("SIMULATION RATE", "number"),
+]
+FUEL_TANKS = [f"FUEL TANK {t} QUANTITY" for t in (
+    "LEFT MAIN", "RIGHT MAIN", "CENTER", "CENTER2", "CENTER3", "LEFT AUX", "RIGHT AUX",
+    "LEFT TIP", "RIGHT TIP", "EXTERNAL1", "EXTERNAL2")]
+
+
+def load_vars(payload_stations):
+    v = [(n, "gallons") for n in FUEL_TANKS]
+    v += [(f"PAYLOAD STATION WEIGHT:{i}", "pounds") for i in range(1, min(payload_stations, 20) + 1)]
+    return v
+
+
 def controls(engines):
     v = [
         ("ELEVATOR POSITION", "position"),
