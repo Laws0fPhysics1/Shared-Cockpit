@@ -25,6 +25,8 @@ DRY_SWITCHES = [  # (label, simvar)
     ("Nav lights", "LIGHT NAV"),
     ("Parking brake", "BRAKE PARKING POSITION"),
     ("Autopilot", "AUTOPILOT MASTER"),
+    ("APU master (L:var)", "L:XMLVAR_OVHD_APU_MASTER"),
+    ("Seatbelts (L:var)", "L:XMLVAR_OVHD_SEATBELTS"),
 ]
 DRY_COM = ["118.000", "121.500", "122.800", "124.350", "127.100"]
 
@@ -63,7 +65,7 @@ class App:
         self.logq = queue.Queue()
         self.root = tk.Tk()
         self.root.title(f"Shared Cockpit {__version__} - {flavor.SIM}")
-        self.root.geometry("680x700")
+        self.root.geometry("720x700")
         self.root.minsize(580, 560)
         self.engine = Engine(self.log, self.s["name"])
         self._dry_vars = {}
@@ -87,7 +89,22 @@ class App:
         self.l_sdk.pack(side="left", padx=8)
         self.pb = ttk.Progressbar(simf, length=140, mode="determinate")
 
-        top = ttk.LabelFrame(self.root, text="Connection")
+        self.nb = ttk.Notebook(self.root)
+        self.nb.pack(fill="both", expand=True, **pad)
+        fly = ttk.Frame(self.nb)
+        self.nb.add(fly, text="Flight")
+        pre = ttk.Frame(self.nb)
+        self.nb.add(pre, text="Pre-flight")
+        if flavor.is_dry():
+            dry = ttk.Frame(self.nb)
+            self.nb.add(dry, text="Dry run")
+        self.tab_insp = ttk.Frame(self.nb)
+        self.nb.add(self.tab_insp, text="Sync inspector")
+        lf = ttk.Frame(self.nb)
+        self.nb.add(lf, text="Log")
+
+        # ---- Flight tab
+        top = ttk.LabelFrame(fly, text="Connection")
         top.pack(fill="x", **pad)
         ttk.Label(top, text="Your name").grid(row=0, column=0, sticky="w", **pad)
         self.v_name = tk.StringVar(value=self.s["name"])
@@ -111,29 +128,42 @@ class App:
         ttk.Button(bar, text="Disconnect", command=self.engine.stop_net).pack(side="left", padx=6)
         ttk.Button(bar, text="Show my public IP", command=self._public_ip).pack(side="left", padx=6)
 
-        st = ttk.LabelFrame(self.root, text="Status")
-        st.pack(fill="x", **pad)
-        self.lbl = {}
-        for i, (k, t) in enumerate([("sim", "Simulator"), ("net", "Network"), ("rtt", "Ping"),
-                                    ("motion", "Motion link"), ("env", "Weather / sim rate"),
-                                    ("aircraft", "Your aircraft"), ("peer_aircraft", "Co-pilot aircraft"),
-                                    ("ie", "Cockpit sync")]):
-            ttk.Label(st, text=t + ":").grid(row=i, column=0, sticky="w", padx=8)
-            self.lbl[k] = ttk.Label(st, text="")
-            self.lbl[k].grid(row=i, column=1, sticky="w", padx=8)
-
-        ctl = ttk.LabelFrame(self.root, text="Controls")
+        ctl = ttk.LabelFrame(fly, text="Controls")
         ctl.pack(fill="x", **pad)
         self.l_pf = tk.Label(ctl, text="", font=("Segoe UI", 13, "bold"))
         self.l_pf.pack(side="left", padx=10, pady=6)
         ttk.Button(ctl, text="Give controls", command=self.engine.give_controls).pack(side="right", padx=6)
         ttk.Button(ctl, text="Take controls", command=self.engine.take_controls).pack(side="right", padx=6)
 
-        if flavor.is_dry():
-            self._build_dry(pad)
+        ck = ttk.LabelFrame(fly, text="Cockpit")
+        ck.pack(fill="x", **pad)
+        ttk.Button(ck, text="Match co-pilot's aircraft", command=self.engine.match_copilot
+                   ).grid(row=0, column=0, sticky="w", padx=8, pady=4)
+        ttk.Label(ck, text="Copies their switches, overhead, fuel and engines (cold & dark vs running).",
+                  foreground="#555").grid(row=0, column=1, sticky="w")
+        ttk.Button(ck, text="Copy co-pilot's flight", command=self._copy_flight
+                   ).grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        ttk.Label(ck, text="Loads their saved flight: position, systems, weather preset, time.",
+                  foreground="#555").grid(row=1, column=1, sticky="w")
 
-        lf = ttk.LabelFrame(self.root, text="Log")
-        lf.pack(fill="both", expand=True, **pad)
+        st = ttk.LabelFrame(fly, text="Status")
+        st.pack(fill="x", **pad)
+        self.lbl = {}
+        for i, (k, t) in enumerate([("sim", "Simulator"), ("net", "Network"), ("rtt", "Ping"),
+                                    ("motion", "Motion link"), ("env", "Weather / sim rate"),
+                                    ("aircraft", "Your aircraft"), ("peer_aircraft", "Co-pilot aircraft"),
+                                    ("ie", "Input events"), ("bridge", "Buttons / overhead")]):
+            ttk.Label(st, text=t + ":").grid(row=i, column=0, sticky="w", padx=8)
+            self.lbl[k] = ttk.Label(st, text="")
+            self.lbl[k].grid(row=i, column=1, sticky="w", padx=8)
+
+        # ---- Pre-flight tab
+        self._build_checklist(pre, pad)
+        if flavor.is_dry():
+            self._build_dry(dry, pad)
+        self._build_inspector(self.tab_insp, pad)
+
+        # ---- Log tab
         self.t_log = tk.Text(lf, height=8, wrap="word", state="disabled", font=("Consolas", 9))
         sb = ttk.Scrollbar(lf, command=self.t_log.yview)
         self.t_log.configure(yscrollcommand=sb.set)
@@ -142,23 +172,80 @@ class App:
         self._mode_changed()
         self._update_sdk_row()
 
-    def _build_dry(self, pad):
-        df = ttk.LabelFrame(self.root, text="Dry run - pretend cockpit (changes sync to your co-pilot)")
-        df.pack(fill="x", **pad)
+    def _build_checklist(self, parent, pad):
+        ttk.Label(parent, text="Before a shared flight - green is checked automatically, grey you check yourself.",
+                  foreground="#555").pack(anchor="w", **pad)
+        self.ck_frame = ttk.Frame(parent)
+        self.ck_frame.pack(fill="x", **pad)
+        self.ck_rows = []
+        br = ttk.LabelFrame(parent, text="In-sim bridge (every button, FMS keys, overhead)")
+        br.pack(fill="x", **pad)
+        self.l_bridge = ttk.Label(br, text="checking...", wraplength=560, justify="left")
+        self.l_bridge.pack(anchor="w", padx=8, pady=4)
+        row = ttk.Frame(br)
+        row.pack(anchor="w", padx=8, pady=(0, 6))
+        self.b_bridge = ttk.Button(row, text="Install / repair bridge", command=self._install_bridge)
+        self.b_bridge.pack(side="left")
+        b_rm = ttk.Button(row, text="Remove bridge", command=self._remove_bridge)
+        b_rm.pack(side="left", padx=8)
+        if flavor.is_dry():
+            self.b_bridge.configure(state="disabled")
+            b_rm.configure(state="disabled")
+
+    def _build_inspector(self, parent, pad):
+        top = ttk.Frame(parent)
+        top.pack(fill="x", **pad)
+        self.l_counts = ttk.Label(top, text="", font=("Consolas", 9), justify="left")
+        self.l_counts.pack(side="left", anchor="w")
+        ttk.Button(top, text="Open log file", command=self._open_synclog).pack(side="right")
+        cols = ("time", "dir", "kind", "name", "value", "note")
+        self.tv = ttk.Treeview(parent, columns=cols, show="headings", height=12)
+        for c, w in zip(cols, (70, 45, 55, 210, 80, 220)):
+            self.tv.heading(c, text=c)
+            self.tv.column(c, width=w, stretch=(c in ("name", "note")))
+        self.tv.tag_configure("fail", foreground="#b00020")
+        self.tv.tag_configure("skip", foreground="#8a6d00")
+        self.tv.tag_configure("in", foreground="#1a5fb4")
+        sb = ttk.Scrollbar(parent, command=self.tv.yview)
+        self.tv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.tv.pack(fill="both", expand=True, **pad)
+        self._insp_last = None
+
+    def _build_dry(self, df, pad):
+        ttk.Label(df, text="Pretend cockpit - changes sync to your co-pilot's pretend cockpit.",
+                  foreground="#555").grid(row=0, column=0, columnspan=4, sticky="w", padx=8, pady=2)
         self.l_pos = ttk.Label(df, text="", font=("Consolas", 9))
-        self.l_pos.grid(row=0, column=0, columnspan=4, sticky="w", padx=8, pady=2)
+        self.l_pos.grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=2)
         for i, (label, var) in enumerate(DRY_SWITCHES):
             v = tk.IntVar()
             ttk.Checkbutton(df, text=label, variable=v,
                             command=lambda var=var, v=v: self._dry_set(var, v.get())
-                            ).grid(row=1 + i // 3, column=i % 3, sticky="w", padx=8)
+                            ).grid(row=2 + i // 3, column=i % 3, sticky="w", padx=8)
             self._dry_vars[var] = v
-        ttk.Label(df, text="COM1").grid(row=3, column=0, sticky="w", padx=8, pady=2)
+        r = 2 + (len(DRY_SWITCHES) + 2) // 3
+        ttk.Label(df, text="COM1").grid(row=r, column=0, sticky="w", padx=8, pady=2)
         self.v_com = tk.StringVar()
         cb = ttk.Combobox(df, textvariable=self.v_com, values=DRY_COM, state="readonly", width=9)
-        cb.grid(row=3, column=1, sticky="w", padx=8, pady=2)
+        cb.grid(row=r, column=1, sticky="w", padx=8, pady=2)
         cb.bind("<<ComboboxSelected>>",
                 lambda e: self._dry_set("COM ACTIVE FREQUENCY:1", round(float(self.v_com.get()) * 1e6)))
+        fms = ttk.LabelFrame(df, text="Pretend FMS (key presses sync like the real MCDU)")
+        fms.grid(row=r + 1, column=0, columnspan=4, sticky="we", padx=8, pady=6)
+        self.l_scratch = tk.Label(fms, text="", font=("Consolas", 14, "bold"), width=18, anchor="w",
+                                  bg="#111", fg="#7CFC00")
+        self.l_scratch.grid(row=0, column=0, columnspan=8, sticky="w", padx=6, pady=4)
+        for i, k in enumerate(list("ABCDEKLS") + list("0123") + ["CLR"]):
+            ttk.Button(fms, text=k, width=4, command=lambda k=k: self._dry_key(k)
+                       ).grid(row=1 + i // 8, column=i % 8, padx=1, pady=1)
+
+    def _dry_key(self, k):
+        sc = self._dry_sim()
+        if not sc:
+            return
+        name = f"A320_Neo_CDU_1_BTN_{k}"
+        sc.press_h(name)                                   # this cockpit
+        self.engine.inbox.put(("ws", {"t": "h", "n": name}, "dry"))   # as if the bridge saw it
 
     def _dry_sim(self):
         sc = self.engine.sc
@@ -249,6 +336,9 @@ class App:
                         "One-time download (about 60-90 MB). It enables syncing of most cockpit "
                         "switches. Nothing gets installed in Windows."):
                     self._fetch_sdk()
+            self._bridge_check(offer=True)
+        else:
+            self._bridge_check()
         threading.Thread(target=self._check_update, daemon=True).start()
 
     def _check_update(self):
@@ -279,6 +369,84 @@ class App:
             except Exception as e:
                 self.log(f"Update failed: {e}")
         threading.Thread(target=go, daemon=True).start()
+
+    # ------------------------------------------------------------ cockpit / bridge
+    def _copy_flight(self):
+        if not self.engine.link:
+            self.log("Connect to your co-pilot first.")
+            return
+        if messagebox.askyesno("Copy co-pilot's flight",
+                               "Your sim will load your co-pilot's flight (position, aircraft systems, "
+                               "fuel, weather preset, time) and show a loading screen.\n\n"
+                               "Their FMS isn't part of a saved flight: program both FMSes together "
+                               "afterwards (key presses sync).\n\nLoad it now?"):
+            self.engine.copy_copilot_flight()
+
+    def _bridge_check(self, offer=False):
+        if flavor.is_dry():
+            self.l_bridge.configure(text="Not needed for a dry run.")
+            return
+
+        def go():
+            try:
+                from . import bridge_install
+                st = bridge_install.status(flavor.KEY)
+            except Exception as e:
+                st = {"message": f"Couldn't check the bridge: {e}"}
+            self.root.after(0, lambda: self._bridge_show(st, offer))
+        threading.Thread(target=go, daemon=True).start()
+
+    def _bridge_show(self, st, offer=False):
+        self._bridge_status = st
+        lines = [st.get("message") or ""]
+        if st.get("bridge_installed") and st.get("bridge_current") is False:
+            lines.append("MSFS updated its cockpit files: click Install / repair to refresh the bridge.")
+        if st.get("conflicts"):
+            lines.append("Conflicts: " + ", ".join(st["conflicts"]))
+        self.l_bridge.configure(text="\n".join(x for x in lines if x))
+        need = st.get("sim_found") and (not st.get("bridge_installed") and st.get("capture_supported")
+                                        or st.get("bridge_current") is False or not st.get("mobiflight"))
+        key = f"bridge_prompted_{flavor.KEY}"
+        if offer and need and not self.s.get(key):
+            self.s[key] = True
+            save_settings(self.s)
+            if messagebox.askyesno(
+                    "In-sim bridge",
+                    "Install the in-sim bridge into MSFS's Community folder?\n\n"
+                    "It lets every cockpit button and FMS key press sync, plus the overhead panel. "
+                    "It adds two add-ons (Shared Cockpit Bridge, MobiFlight event module, MIT licence). "
+                    "Restart MSFS afterwards.\n\nYou can remove it any time on the Pre-flight tab."):
+                self._install_bridge()
+
+    def _install_bridge(self):
+        self.b_bridge.configure(state="disabled")
+
+        def go():
+            try:
+                from . import bridge_install
+                st = bridge_install.install(flavor.KEY, log=self.log)
+                if st.get("changed") or st.get("restart_needed"):
+                    self.log("In-sim bridge installed. Restart MSFS so it loads it.")
+            except Exception as e:
+                self.log(f"Bridge install failed: {e}")
+            self.root.after(0, lambda: (self.b_bridge.configure(state="normal"), self._bridge_check()))
+        threading.Thread(target=go, daemon=True).start()
+
+    def _remove_bridge(self):
+        if not messagebox.askyesno("Remove bridge", "Remove the Shared Cockpit Bridge add-on from MSFS's "
+                                   "Community folder? (MobiFlight's module is left in place.)"):
+            return
+        try:
+            from . import bridge_install
+            bridge_install.uninstall(flavor.KEY, log=self.log)
+        except Exception as e:
+            self.log(f"Couldn't remove the bridge: {e}")
+        self._bridge_check()
+
+    def _open_synclog(self):
+        p = self.engine.cp.slog.path
+        if p and os.path.exists(p):
+            os.startfile(p)
 
     # ------------------------------------------------------------ actions
     def _go(self):
@@ -349,7 +517,46 @@ class App:
             com = "%.3f" % (sc.get("COM ACTIVE FREQUENCY:1") / 1e6)
             if self.v_com.get() != com:
                 self.v_com.set(com)
+            self.l_scratch.configure(text=sc.scratchpad or "_")
+        self._tick_n = getattr(self, "_tick_n", 0) + 1
+        if self._tick_n % 7 == 0:
+            self._refresh_checklist()
+        if self._tick_n % 3 == 0 and self.nb.select() == str(self.tab_insp):
+            self._refresh_inspector()
         self.root.after(150, self._refresh)
+
+    def _refresh_checklist(self):
+        items = self.engine.cp.checklist()
+        while len(self.ck_rows) < len(items):
+            r = len(self.ck_rows)
+            mark = tk.Label(self.ck_frame, text="", font=("Segoe UI", 11, "bold"), width=2)
+            mark.grid(row=r, column=0, sticky="w")
+            name = ttk.Label(self.ck_frame, text="")
+            name.grid(row=r, column=1, sticky="w", padx=4)
+            det = ttk.Label(self.ck_frame, text="", foreground="#555", wraplength=380)
+            det.grid(row=r, column=2, sticky="w", padx=8)
+            self.ck_rows.append((mark, name, det))
+        for (mark, name, det), (label, ok, detail) in zip(self.ck_rows, items):
+            mark.configure(text={True: "\u2714", False: "\u2716", None: "\u25CB"}[ok],
+                           fg={True: "#1a7f37", False: "#b00020", None: "#777"}[ok])
+            name.configure(text=label)
+            det.configure(text=detail)
+
+    def _refresh_inspector(self):
+        slog = self.engine.cp.slog
+        ev = slog.recent(200)
+        sig = (len(ev), ev[-1][0] if ev else 0)
+        if sig != self._insp_last:
+            self._insp_last = sig
+            self.tv.delete(*self.tv.get_children())
+            for t, d, k, n, v, note in reversed(ev):
+                self.tv.insert("", "end", values=(time.strftime("%H:%M:%S", time.localtime(t)), d, k, n, v, note),
+                               tags=(d,))
+        lines = []
+        for kind, c in slog.summary().items():
+            lines.append(f"{kind:7s} sent {c['out']:5d}  received {c['in']:5d}  applied {c['apply']:5d}  "
+                         f"failed {c['fail']:4d}  skipped {c['skip']:4d}")
+        self.l_counts.configure(text="\n".join(lines) or "No sync traffic yet.")
 
     def restart(self):
         self.engine.shutdown()

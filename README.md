@@ -2,8 +2,9 @@
 
 Fly one airplane with a friend in **Microsoft Flight Simulator 2024 or 2020**. One of you
 hosts (port-forwards a TCP port); the other types in the host's IP and port. Whoever has the
-controls flies. The other seat's airplane follows them exactly, and switches, radios and
-autopilot sync both ways. Works with the Steam and Microsoft Store / Xbox app versions.
+controls flies. The other seat's airplane follows them exactly, and the cockpit syncs both ways:
+switches, radios, autopilot, the overhead panel, and every button press, including FMS/MCDU keys.
+Works with the Steam and Microsoft Store / Xbox app versions.
 
 ## Install (the easy way)
 1. Download **[install.bat](install.bat)** (on GitHub: open it → *Download raw file*).
@@ -11,24 +12,50 @@ autopilot sync both ways. Works with the Steam and Microsoft Store / Xbox app ve
 
 It installs Python if needed, downloads the app to `%LOCALAPPDATA%\SharedCockpit`,
 detects MSFS 2020/2024, fetches SimConnect from Microsoft's SDK server (only the one DLL,
-~60–90 MB, nothing installed in Windows), and adds Desktop + Start Menu shortcuts.
+~60–90 MB, nothing installed in Windows), installs the **in-sim bridge** into MSFS's Community
+folder (see below), and adds Desktop + Start Menu shortcuts. Restart MSFS after the first install.
 Run it again any time to repair. To remove everything, run `install.bat /uninstall`.
 
 The app checks GitHub for updates on launch and offers to install them.
 
 ## Fly together
-1. Both: start the sim and load into a flight with the **same aircraft** (different liveries are fine).
-2. Both: open **Shared Cockpit** and pick your sim in the *Simulator* dropdown (auto-detected).
-3. **Host:** choose *Host*, port `50555`, click **Start hosting**, then **Show my public IP** and
+1. Both: in MSFS set **Multiplayer: Off** (world map). Shared Cockpit syncs the plane itself;
+   with MSFS multiplayer on you'd each see the other's plane sitting inside your own.
+2. Both: load into a flight with the **same aircraft** (different liveries are fine).
+3. Both: open **Shared Cockpit**, pick your sim in the *Simulator* dropdown (auto-detected) and
+   check the **Pre-flight** tab: same aircraft, same weather, crash damage off, bridge connected.
+4. **Host:** choose *Host*, port `50555`, click **Start hosting**, then **Show my public IP** and
    send your friend that IP and port.
-4. **Friend:** choose *Join a host*, type the IP and port, click **Connect**.
-5. The host starts with the controls. Use **Take controls** / **Give controls** to swap.
+5. **Friend:** choose *Join a host*, type the IP and port, click **Connect**.
+6. **Line up the two cockpits** (Flight tab, *Cockpit* box). The friend clicks:
+   - **Copy co-pilot's flight**: loads the host's saved flight (position, aircraft systems, fuel,
+     weather preset, time). The best start: do it right after connecting.
+   - **Match co-pilot's aircraft**: copies the host's switches, overhead, fuel and engine state
+     (cold & dark vs running) without reloading. Engines use the sim's auto-start, which some
+     aircraft ignore; then start them by hand.
+7. The host starts with the controls. Use **Take controls** / **Give controls** to swap.
+
+### The in-sim bridge (every button, FMS keys, overhead)
+MSFS doesn't let an outside app see cockpit button presses, so the installer adds two small
+add-ons to MSFS's Community folder (manage them on the **Pre-flight** tab):
+- **Shared Cockpit Bridge.** A hook in the cockpit screens' code (`VCockpit.js`, generated from
+  your own copy of the sim's file) reports every button press (H: events) to the app, and
+  replays your co-pilot's presses. Pressing **A** on your MCDU types **A** on theirs.
+- **MobiFlight event module** (MIT licence, from MobiFlight). Lists each aircraft's internal
+  cockpit variables (L:vars, e.g. most of the A320neo overhead) so the app can sync them all.
+  Values that change on their own (timers, animations) are detected and left alone.
+
+FMS sync works by replaying key presses (like YourControls does), so both FMSes must start
+the same: use **Copy co-pilot's flight**, then program the FMS together.
+In MSFS 2024 the cockpit UI files are packed, so button/FMS capture is **2020-only for now**;
+2024 still gets the overhead (L:vars) through MobiFlight. Another add-on that also replaces
+`VCockpit.js` (e.g. YourControls) conflicts; the Pre-flight tab warns about it.
 
 ### Test without the game: Dry run
 Pick **Dry run (no sim)** in the Simulator dropdown. A pretend airplane flies circles on the
 host's side; when the friend joins, their pretend airplane freezes and follows. Flip the
-pretend switches (gear, lights, autopilot, COM1) and watch them change on the other PC. Use
-it to check port forwarding before a flight.
+pretend switches (gear, lights, autopilot, COM1, overhead L:vars) and type on the pretend
+FMS keypad, and watch them change on the other PC. Use it to check port forwarding before a flight.
 
 To try a bad connection, start the app with `SC_NETSIM` set, for example in a command prompt:
 `set SC_NETSIM=delay=0.08,jitter=0.03,loss=0.05` then `python run.py`.
@@ -58,8 +85,8 @@ New-NetFirewallRule -DisplayName "Shared Cockpit UDP" -Direction Inbound -Protoc
   then eases back to buffered playback. Fuel and payload are copied to whoever takes over.
 - **Height above ground near the ground.** Below 100 ft the follower keeps the same height above
   *its own* runway, so different scenery elevations can't sink or float the wheels.
-- **Weather check.** The app warns when your wind, pressure or sim rate differ, because those make
-  the two flight models diverge after a handoff.
+- **Weather check.** The app warns when your wind, pressure, temperature, visibility, rain/snow or
+  sim rate differ, because those make the two flight models diverge after a handoff.
 
 ## What syncs
 | | Direction |
@@ -70,12 +97,22 @@ New-NetFirewallRule -DisplayName "Shared Cockpit UDP" -Direction Inbound -Protoc
 | Exterior/panel/cabin lights, battery, alternator, avionics, pitot heat | both ways |
 | COM1/2, NAV1/2 (active + standby), OBS, transponder, baro | both ways |
 | Autopilot modes and HDG/ALT/VS/SPD selectors | both ways |
-| Most other cockpit switches/knobs ("input events", experimental) | both ways |
+| Every cockpit button press, incl. FMS/MCDU keys (in-sim bridge, MSFS 2020) | both ways |
+| Aircraft-specific switches/knobs, e.g. the A320neo overhead (L:vars via MobiFlight) | both ways |
+| Cockpit "input events" (B: vars, needs the SDK SimConnect.dll) | both ways |
+| Whole aircraft state on demand: **Match co-pilot's aircraft** | on click |
+| Saved flight incl. weather preset and time: **Copy co-pilot's flight** | on click |
 
 ## Tips / known limits
 - **Turn off crash damage** on the non-flying side (the frozen plane is teleported every frame).
 - Non-flying pilot: hands off the yoke/throttle.
-- Weather and time aren't synced; both pick live weather and live time.
+- **Weather can't be forced.** MSFS removed every weather-setting function from SimConnect,
+  so no app can set it. Both pick Live Weather (or the same preset; *Copy co-pilot's flight*
+  brings a preset along). The Pre-flight tab compares the two.
+- **ATC isn't synced.** No API exists for it; let one pilot handle ATC.
+- **Something didn't sync?** The **Sync inspector** tab lists every event sent, received, applied,
+  failed or skipped, and everything goes to `logs/sync-*.log` too. Variables that should never
+  sync can be listed in `shared_cockpit/lvar_ignore.txt` (one regex per line).
 - Study-level add-ons (PMDG, Fenix, FBW, ...) keep state in their own systems; expect partial switch sync.
 - MSFS 2024 has a known slight jitter when an app places an aircraft every frame (YourControls has
   the same issue).
@@ -83,7 +120,9 @@ New-NetFirewallRule -DisplayName "Shared Cockpit UDP" -Direction Inbound -Protoc
 ## For developers
 - Run from source: `python run.py` (Python 3.10+, standard library only).
 - Tests (no sim needed): `python tests/test_loopback.py`, `test_dryrun.py`, `test_smooth.py`
-  (measures smoothness under simulated packet loss and lag), `test_updater.py`.
+  (measures smoothness under simulated packet loss and lag), `test_updater.py`, `test_cockpit.py`
+  (L:vars, FMS keys, Match, Copy flight, checklist), `test_wsbridge.py`, `test_mobiflight.py`,
+  `test_bridge_install.py`.
 - **Publishing: double-click `publish.bat`.** On the first run it asks for your GitHub repo
   (create an empty one first) and sets it in `install.bat` and the updater. Every run checks tests,
   offers a version bump (installed copies then get an update prompt), commits and pushes.
@@ -96,6 +135,10 @@ New-NetFirewallRule -DisplayName "Shared Cockpit UDP" -Direction Inbound -Protoc
 | `install.bat` | one-file installer / updater |
 | `publish.bat` | dev: test, version-bump, commit and push to GitHub |
 | `shared_cockpit/engine.py` | sync logic: who flies, interpolation, switch mirroring |
+| `shared_cockpit/cockpit.py` | button/FMS relay, L:var auto-sync, Match co-pilot, Copy flight, checklist |
+| `shared_cockpit/wsbridge.py` / `bridge_hook.js` / `bridge_install.py` | in-sim bridge: local WebSocket, cockpit JS hook, Community installer |
+| `shared_cockpit/mobiflight.py` | MobiFlight WASM module client (L:var list, calculator code) |
+| `shared_cockpit/synclog.py` | sync log + inspector data |
 | `shared_cockpit/syncdefs.py` | which variables sync, the place to add more |
 | `shared_cockpit/simconnect.py` | ctypes SimConnect binding |
 | `shared_cockpit/fakesim.py` | dry-run simulator |

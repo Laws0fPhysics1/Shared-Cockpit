@@ -1,0 +1,3 @@
+# Extra L:vars that should never sync, one regular expression per line (case-insensitive).
+# Example:
+# ^A320_Neo_MFD_

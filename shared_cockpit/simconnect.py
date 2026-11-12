@@ -36,6 +36,7 @@ RECV_OPEN = 2
 RECV_QUIT = 3
 RECV_EVENT = 4
 RECV_SIMOBJECT_DATA = 8
+RECV_CLIENT_DATA = 16
 RECV_ENUMERATE_INPUT_EVENTS = 34
 RECV_GET_INPUT_EVENT = 35
 RECV_SUBSCRIBE_INPUT_EVENT = 36
@@ -45,6 +46,16 @@ INPUT_EVENT_TYPE_DOUBLE = 0
 INPUT_EVENT_TYPE_STRING = 1
 
 E_FAIL = -2147467259  # 0x80004005 as signed
+
+# SIMCONNECT_CLIENT_DATA_PERIOD (client data areas, e.g. a WASM module's)
+CDP_NEVER = 0
+CDP_ONCE = 1
+CDP_VISUAL_FRAME = 2
+CDP_ON_SET = 3
+CDP_SECOND = 4
+# SIMCONNECT_CLIENT_DATA_REQUEST_FLAG
+CD_FLAG_CHANGED = 0x1
+CD_FLAG_TAGGED = 0x2
 
 
 class SimConnectError(RuntimeError):
@@ -111,6 +122,22 @@ class SimConnect:
             if hasattr(d, "SimConnect_EnumerateInputEvents"):
                 d.SimConnect_EnumerateInputEvents.argtypes = [H, D]
                 d.SimConnect_EnumerateInputEvents.restype = c_long
+        # client data (all exported by the old bundled DLL too)
+        d.SimConnect_MapClientDataNameToID.argtypes = [H, c_char_p, D]
+        d.SimConnect_AddToClientDataDefinition.argtypes = [H, D, D, D, ctypes.c_float, D]
+        d.SimConnect_RequestClientData.argtypes = [H, D, D, D, D, D, D, D, D]
+        d.SimConnect_SetClientData.argtypes = [H, D, D, D, D, D, c_void_p]
+        for f in ("SimConnect_MapClientDataNameToID", "SimConnect_AddToClientDataDefinition",
+                  "SimConnect_RequestClientData", "SimConnect_SetClientData"):
+            getattr(d, f).restype = c_long
+        # flights
+        d.SimConnect_FlightSave.argtypes = [H, c_char_p, c_char_p, c_char_p, D]
+        d.SimConnect_FlightLoad.argtypes = [H, c_char_p]
+        d.SimConnect_FlightSave.restype = d.SimConnect_FlightLoad.restype = c_long
+        self.has_get_input_event = hasattr(d, "SimConnect_GetInputEvent")
+        if self.has_get_input_event:
+            d.SimConnect_GetInputEvent.argtypes = [H, D, c_uint64]
+            d.SimConnect_GetInputEvent.restype = c_long
 
     def _ok(self, hr, what):
         if hr < 0:
@@ -182,6 +209,43 @@ class SimConnect:
         hr = self.dll.SimConnect_SetInputEvent(self.h, hash_, 8, byref(v))
         self._ok(hr, "SetInputEvent")
 
+    def get_input_event(self, req_id, hash_):
+        """Ask for an input event's current value; answer arrives as ("input_value", ...)."""
+        if not getattr(self, "has_get_input_event", False):
+            raise SimConnectError("GetInputEvent needs the MSFS SDK SimConnect.dll")
+        hr = self.dll.SimConnect_GetInputEvent(self.h, req_id, hash_)
+        self._ok(hr, "GetInputEvent")
+
+    # -- flights -------------------------------------------------------
+    def flight_save(self, path, title="Shared Cockpit", description="", flags=0):
+        hr = self.dll.SimConnect_FlightSave(self.h, path.encode("mbcs"), title.encode("mbcs"),
+                                            description.encode("mbcs"), flags)
+        self._ok(hr, "FlightSave")
+
+    def flight_load(self, path):
+        hr = self.dll.SimConnect_FlightLoad(self.h, path.encode("mbcs"))
+        self._ok(hr, "FlightLoad")
+
+    # -- client data areas (talking to a WASM module such as MobiFlight) --
+    def map_client_data(self, name, area_id):
+        hr = self.dll.SimConnect_MapClientDataNameToID(self.h, name.encode(), area_id)
+        self._ok(hr, f"MapClientDataNameToID({name})")
+
+    def add_to_client_data_def(self, def_id, offset, size_bytes):
+        hr = self.dll.SimConnect_AddToClientDataDefinition(
+            self.h, def_id, offset, size_bytes, 0.0, UNUSED)
+        self._ok(hr, "AddToClientDataDefinition")
+
+    def request_client_data(self, area_id, req_id, def_id, period, flags=0):
+        hr = self.dll.SimConnect_RequestClientData(
+            self.h, area_id, req_id, def_id, period, flags, 0, 0, 0)
+        self._ok(hr, "RequestClientData")
+
+    def set_client_data(self, area_id, def_id, payload: bytes):
+        buf = ctypes.create_string_buffer(payload, len(payload))
+        hr = self.dll.SimConnect_SetClientData(self.h, area_id, def_id, 0, 0, len(payload), buf)
+        self._ok(hr, "SetClientData")
+
     # -- dispatch ------------------------------------------------------
     def poll(self):
         """Yield parsed messages until the queue is empty.
@@ -201,6 +265,15 @@ class SimConnect:
             if rid == RECV_SIMOBJECT_DATA:
                 req = struct.unpack_from("<I", raw, 12)[0]
                 yield ("data", req, raw[40:])
+            elif rid == RECV_CLIENT_DATA:
+                # same layout as SIMOBJECT_DATA: dwRequestID @12, data @40
+                req = struct.unpack_from("<I", raw, 12)[0]
+                yield ("client_data", req, raw[40:])
+            elif rid == RECV_GET_INPUT_EVENT:
+                # RequestID @12, eType @16, Value inline @20
+                if len(raw) >= 28:
+                    req, typ = struct.unpack_from("<II", raw, 12)
+                    yield ("input_value", req, struct.unpack_from("<d", raw, 20)[0], typ)
             elif rid == RECV_EVENT:
                 _grp, eid, data = struct.unpack_from("<III", raw, 12)
                 yield ("event", eid, data)

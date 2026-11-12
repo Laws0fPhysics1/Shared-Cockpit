@@ -25,9 +25,10 @@ from .simconnect import (Block, SimConnect, SimConnectError, PERIOD_NEVER, PERIO
                          PERIOD_SIM_FRAME, PERIOD_SECOND, FLAG_CHANGED, DT_STRING256,
                          DT_FLOAT64)
 
-PROTO = 2
+PROTO = 3
 SEND_HZ = 40.0          # PF motion packets per second
 BUF_START, BUF_MIN, BUF_MAX = 0.12, 0.035, 0.60   # total playback delay behind the PF (s)
+BUF_SLEW = 0.08         # max change of the shown delay per second (8% playback speed)
 MAX_EXTRAP = 0.30       # max prediction past the newest snapshot (s)
 APPLY_HZ = 60.0         # fallback placement rate when own sim frames aren't arriving
 HANDOFF_RAMP = 2.0      # s to ease from "live" to buffered playback after giving controls
@@ -69,7 +70,9 @@ class Snap:
 
 
 class Engine:
-    def __init__(self, log, name="Pilot"):
+    PROTO = PROTO
+
+    def __init__(self, log, name="Pilot", bridge_port=None):
         self.log = log
         self.name = name
         self.inbox = queue.Queue()
@@ -110,6 +113,7 @@ class Engine:
         self._clk = deque()          # (t_local, rtt, clock difference) from ping/pong, NTP-style
         self._ages = deque()         # (t_local, age of each motion packet on arrival)
         self.buf = BUF_START
+        self._buf_shown, self._buf_t = BUF_START, 0.0
         self.rtt = None
         self._ramp_t0 = None
         self._catchup_t0 = None
@@ -121,6 +125,7 @@ class Engine:
         self.peer_env = None
         self._last_env_send = 0.0
         self._warned = {}
+        self.env_issues = []
         self.load_blocks = {}
 
         self.sw_prev = {}            # last local reading per switch
@@ -133,7 +138,10 @@ class Engine:
         self.exc_count = 0
 
         self.status = {"sim": "Not connected", "net": "Idle", "pf": "", "aircraft": "",
-                       "peer_aircraft": "", "rtt": "", "ie": "", "motion": "", "env": ""}
+                       "peer_aircraft": "", "rtt": "", "ie": "", "motion": "", "env": "",
+                       "bridge": ""}
+        from .cockpit import CockpitSync
+        self.cp = CockpitSync(self, bridge_port)      # buttons/FMS, L:vars, match, flight copy
         threading.Thread(target=self._sim_loop, daemon=True).start()
 
     # ================================================================ public (GUI thread)
@@ -190,9 +198,16 @@ class Engine:
     def give_controls(self):
         self.inbox.put(("cmd", "give"))
 
+    def match_copilot(self):
+        self.inbox.put(("cmd", "match"))
+
+    def copy_copilot_flight(self):
+        self.inbox.put(("cmd", "flight"))
+
     def shutdown(self):
         self.running = False
         self.stop_net()
+        self.cp.close()
 
     def i_have_controls(self):
         return self.link is None or self.pf == self.role
@@ -228,6 +243,7 @@ class Engine:
         self._udp_tx_ok = False
         self.status["motion"] = ""
         self.peer = {}
+        self.cp.on_disconnect()
         self.inbox.put(("cmd", "disconnected"))
 
     def _on_udp(self, msg, addr):
@@ -368,6 +384,7 @@ class Engine:
         self.sw_prev = {}
         self._latest_ctrl = None
         self.ready = True
+        self.cp.on_build(base)
         if sc.has_input_events:
             try:
                 self.ie_by_hash, self.ie_by_name, self.ie_type = {}, {}, {}
@@ -381,6 +398,9 @@ class Engine:
     # ---------------------------------------------------------------- sim messages
     def _on_sim(self, m):
         kind = m[0]
+        if kind in ("client_data", "input_value"):
+            self.cp.on_sim(m)
+            return
         if kind == "data":
             req, raw = m[1], m[2]
             if req == REQ_INFO:
@@ -410,6 +430,8 @@ class Engine:
                 self._frz_state = self.frz.unpack(raw)
             elif req == self.REQ_ENV:
                 self._env = self.env.unpack(raw)
+            else:
+                self.cp.on_data(req, raw)
         elif kind == "event":
             if m[1] in (EV_AIRCRAFT_LOADED, EV_FLIGHT_LOADED, EV_SIM_START):
                 self.sc.request(REQ_INFO, DEF_INFO, PERIOD_ONCE)
@@ -582,7 +604,14 @@ class Engine:
 
     def _render_time(self):
         """Co-pilot-clock time to show: buffered, or easing to/from 'live' around a handoff."""
-        delay = self.buf
+        # The shown delay follows the adaptive buffer at most BUF_SLEW s per s, so a
+        # buffer change never shows as the plane visibly slowing down or speeding up.
+        t = net.now()
+        dt = min(t - self._buf_t, 0.1) if self._buf_t else 0.0
+        self._buf_t = t
+        step = BUF_SLEW * dt
+        self._buf_shown += max(-step, min(step, self.buf - self._buf_shown))
+        delay = self._buf_shown
         if self._catchup_t0 is not None:          # taking over: ease to live
             delay *= 1.0 - min((net.now() - self._catchup_t0) / CATCHUP, 1.0)
         elif self._ramp_t0 is not None:           # just gave controls: ease from live
@@ -632,7 +661,9 @@ class Engine:
         e = self._env
         n = len(sd.ENV)
         return {"t": "env", "w": [round(e[0], 1), round(e[1], 1)], "p": round(e[2], 2),
-                "r": round(e[3], 3), "l": [round(x, 3) for x in e[n:]]}
+                "r": round(e[3], 3), "x": [round(e[sd.E_TEMP], 1), round(e[sd.E_VIS]),
+                                           int(e[sd.E_PRECIP])],
+                "l": [round(x, 3) for x in e[n:]]}
 
     def _check_env(self):
         e, p = self._env, self.peer_env
@@ -647,6 +678,18 @@ class Engine:
             issues.append(f"pressure (you {e[2]:.0f} hPa, co-pilot {p['p']:.0f} hPa)")
         if abs(e[3] - p["r"]) > 0.01:
             issues.append(f"sim rate (you {e[3]:g}x, co-pilot {p['r']:g}x)")
+        if p.get("x"):
+            pt, pvis, ppr = p["x"]
+            if abs(e[sd.E_TEMP] - pt) > 3.0:
+                issues.append(f"temperature (you {e[sd.E_TEMP]:.0f} C, co-pilot {pt:.0f} C)")
+            vis, lo = e[sd.E_VIS], min(e[sd.E_VIS], pvis)
+            if lo < 15000 and abs(vis - pvis) > 0.3 * max(vis, pvis, 1.0):
+                issues.append(f"visibility (you {vis / 1000:.1f} km, co-pilot {pvis / 1000:.1f} km)")
+            names = {2: "none", 4: "rain", 8: "snow"}
+            if int(e[sd.E_PRECIP]) != ppr:
+                issues.append(f"precipitation (you {names.get(int(e[sd.E_PRECIP]), '?')}, "
+                              f"co-pilot {names.get(ppr, '?')})")
+        self.env_issues = issues
         self.status["env"] = "matched" if not issues else "differs: " + ", ".join(i.split(" (")[0] for i in issues)
         t = net.now()
         for i in issues:
@@ -654,7 +697,7 @@ class Engine:
             if t - self._warned.get(key, -1e9) > 60:
                 self._warned[key] = t
                 self.log(f"Weather/sim differs from co-pilot: {i}. Pick the same weather preset "
-                         "(not live weather) and sim rate for smooth control handoffs.")
+                         "(or both Live Weather) and sim rate for smooth control handoffs. MSFS doesn't let apps set the weather.")
 
     def _apply_peer_load(self):
         """When taking the controls, copy the previous pilot's fuel & payload."""
@@ -696,6 +739,8 @@ class Engine:
             out[key] = v
         if out:
             self._send({"t": "sw", "s": out})
+            for k, v in out.items():
+                self.cp.slog.add("out", "switch", k, v)
 
     def _apply_switches(self, values, full=False):
         if not (self.sc and self.ready):
@@ -710,6 +755,7 @@ class Engine:
             cur = self.sw_prev.get(key)
             if cur is not None and abs(cur - v) <= sd.tolerance(unit):
                 continue
+            self.cp.slog.add("apply", "switch", key, v, "full state" if full else "")
             try:
                 if kind == "set":
                     self.sw_set_blocks[key].write([v])
@@ -724,6 +770,7 @@ class Engine:
                         self.sc.send_event(arg)
             except SimConnectError as e:
                 self.log(f"Could not apply {key}: {e}")
+                self.cp.slog.add("fail", "switch", key, v, str(e))
 
     # ---------------------------------------------------------------- input events
     def _on_local_input_event(self, h, v):
@@ -737,6 +784,7 @@ class Engine:
             del self.ie_applied[name]          # echo of the peer's change
             return
         self._send({"t": "ie", "n": name, "v": v})
+        self.cp.slog.add("out", "input", name, v)
 
     def _apply_input_event(self, name, v):
         if not (self.sc and self.sc.has_input_events):
@@ -747,8 +795,10 @@ class Engine:
         self.ie_applied[name] = v
         try:
             self.sc.set_input_event(h, v)
+            self.cp.slog.add("apply", "input", name, v)
         except SimConnectError as e:
             self.log(f"Input event {name} failed: {e}")
+            self.cp.slog.add("fail", "input", name, v, str(e))
 
     # ---------------------------------------------------------------- control ownership
     def _set_pf(self, pf, announce=False):
@@ -812,6 +862,13 @@ class Engine:
                     self.log("Offering the controls to your co-pilot...")
             elif c == "disconnected":
                 self._set_pf(self.role or "host")
+            elif c == "match":
+                self.cp.request_match()
+            elif c == "flight":
+                self.cp.request_flight()
+            return
+        if item[0] == "ws":
+            self.cp.on_ws(item[1], item[2])
             return
         if item[0] == "udp":
             msg, addr = item[1], item[2]
@@ -825,6 +882,8 @@ class Engine:
             return
         msg = item[1]
         t = msg.get("t")
+        if self.cp.on_net(msg):
+            return
         if t == "mo":
             if self.pf != self.role:
                 self._on_remote_motion(msg)
@@ -912,6 +971,7 @@ class Engine:
         self._net_tick(t)
         if not self.ready:
             return
+        self.cp.tick(t)
         if self.link and self._env and t - self._last_env_send > 2.0:
             self._last_env_send = t
             self._send(self._env_message())

@@ -112,9 +112,9 @@ git config --global user.email "!GMAIL!"
 rem ---- Tests ----------------------------------------------------------------
 if /i "!OPT!"=="/fast" goto :skiptests
 echo.
-echo Running tests (about a minute; "publish.bat /fast" skips them)...
+echo Running tests (about two minutes; "publish.bat /fast" skips them)...
 set "FAILED="
-for %%t in (loopback dryrun smooth updater) do (
+for %%t in (loopback dryrun smooth updater cockpit wsbridge mobiflight bridge_install) do (
   %PY% tests\test_%%t.py >"%TEMP%\sc_test_%%t.log" 2>&1
   if errorlevel 1 (
     echo   %%t  FAILED  - log: %TEMP%\sc_test_%%t.log

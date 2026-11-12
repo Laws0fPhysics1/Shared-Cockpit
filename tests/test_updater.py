@@ -14,8 +14,8 @@ from shared_cockpit import updater  # noqa: E402
 
 # version compare
 updater.REPO = "someone/shared-cockpit"
-updater.latest_version = lambda timeout=6: "1.2.0"
-assert updater.update_available() == "1.2.0"
+updater.latest_version = lambda timeout=6: "99.0.0"
+assert updater.update_available() == "99.0.0"
 updater.latest_version = lambda timeout=6: updater.__version__
 assert updater.update_available() is None
 print("OK version check")

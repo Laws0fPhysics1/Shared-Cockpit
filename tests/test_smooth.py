@@ -117,19 +117,19 @@ wait(lambda: A.sc.frozen() and not B.sc.frozen(), what="handoff")
 time.sleep(4.0)
 
 
-def speed_range(hist, t_from, t_to):
-    """Min/max ground speed (ft/s) between consecutive frames: a jump shows as a spike,
-    a pause as ~0. True speed is 202.6 ft/s."""
+def max_hop(hist, t_from, t_to, speed=202.6):
+    """Biggest per-frame deviation (ft) from steady motion at the true speed. A
+    jump-back on handoff was 40-54 ft; one-frame timing noise from running both
+    'PCs' in one Python process is a few ft."""
     h = [x for x in hist if t_from <= x[0] <= t_to]
-    sp = [dist_ft(a[1], a[2], b[1], b[2]) / (b[0] - a[0]) for a, b in zip(h, h[1:]) if b[0] - a[0] > 0.01]
-    return min(sp), max(sp)
+    return max(abs(dist_ft(a[1], a[2], b[1], b[2]) - speed * (b[0] - a[0])) for a, b in zip(h, h[1:]))
 
 
-a_lo, a_hi = speed_range(list(A.sc.history), th - 0.5, th + 5)
-b_lo, b_hi = speed_range(list(B.sc.history), th - 0.5, th + 5)
-print(f"OK handoff over 80 ms lag: giver speed {a_lo:.0f}-{a_hi:.0f} ft/s, taker {b_lo:.0f}-{b_hi:.0f} ft/s "
-      f"(true 203; a jump would spike past 1000)")
-assert 140 < a_lo and a_hi < 270 and 140 < b_lo and b_hi < 270, (a_lo, a_hi, b_lo, b_hi)
+hop_a = max_hop(list(A.sc.history), th - 0.5, th + 5)
+hop_b = max_hop(list(B.sc.history), th - 0.5, th + 5)
+print(f"OK handoff over 80 ms lag: biggest per-frame hop giver {hop_a:.1f} ft, taker {hop_b:.1f} ft "
+      f"(a jump-back was 40-54 ft)")
+assert hop_a < 8 and hop_b < 8, (hop_a, hop_b)
 assert abs(B.sc.get("FUEL TANK LEFT MAIN QUANTITY") - 10.0) < 0.1, B.sc.get("FUEL TANK LEFT MAIN QUANTITY")
 print("OK fuel copied to the new pilot flying")
 A.take_controls()

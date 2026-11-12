@@ -55,6 +55,8 @@ def remove_shortcuts():
             print("  removed " + lnk)
         except OSError:
             pass
+    # install.bat /uninstall runs this: take our in-sim bridge out of Community too.
+    remove_bridges()
 
 
 def setup():
@@ -84,5 +86,36 @@ def setup():
         except Exception as e:
             print(f"  Couldn't fetch SimConnect for {flavor.SIM} ({e}). The app will offer it again.")
     save_settings(s)
+    install_bridges(found)
     print("Creating shortcuts...")
     make_shortcuts()
+
+
+def install_bridges(keys=None):
+    """Put the in-sim bridge (button/FMS capture + MobiFlight module) into each sim's
+    Community folder. Errors are reported, never fatal."""
+    from . import bridge_install
+    keys = flavor.detect_installed() if keys is None else keys
+    restart = False
+    for key in keys:
+        print(f"In-sim bridge for MSFS {key}...", flush=True)
+        try:
+            st = bridge_install.install(key, log=lambda m: print("  " + m, flush=True))
+            restart = restart or st.get("restart_needed")
+            if st.get("conflicts"):
+                print("  WARNING: " + st["message"])
+        except Exception as e:
+            print(f"  Couldn't install the in-sim bridge for MSFS {key} ({e}).")
+    if restart:
+        print("NOTE: restart MSFS after this first install so it loads the bridge.")
+
+
+def remove_bridges(keys=None):
+    """Remove our own bridge package from each sim's Community folder (MobiFlight is kept)."""
+    from . import bridge_install
+    keys = flavor.detect_installed() if keys is None else keys
+    for key in keys:
+        try:
+            bridge_install.uninstall(key, log=lambda m: print("  " + m))
+        except Exception as e:
+            print(f"  Couldn't remove the bridge for MSFS {key} ({e}).")

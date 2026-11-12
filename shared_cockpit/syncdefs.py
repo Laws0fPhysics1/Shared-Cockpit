@@ -46,6 +46,23 @@ ENV = [
     ("AMBIENT WIND VELOCITY", "knots"),
     ("SEA LEVEL PRESSURE", "millibars"),
     ("SIMULATION RATE", "number"),
+    ("AMBIENT TEMPERATURE", "celsius"),
+    ("AMBIENT VISIBILITY", "meters"),
+    ("AMBIENT PRECIP STATE", "mask"),        # 2 none, 4 rain, 8 snow
+]
+E_TEMP, E_VIS, E_PRECIP = 4, 5, 6
+
+# Read once a second by the cockpit module: engines running + crash detection.
+def state_vars(engines):
+    v = [(f"GENERAL ENG COMBUSTION:{i}", "bool") for i in range(1, max(1, min(4, engines)) + 1)]
+    v.append(("REALISM CRASH DETECTION", "bool"))
+    return v
+
+# L:vars that are never synced (regexes, case-insensitive). Extend in lvar_ignore.txt.
+LVAR_IGNORE = [
+    r"^MobiFlight", r"^SharedCockpit", r"^YourControl",
+    r"TIMER", r"_TIME$", r"ANIM", r"BLINK", r"FLASH", r"SOUND",
+    r"^XMLVAR_.*_Anim", r"POTENTIOMETER_\d+_ANIM",
 ]
 FUEL_TANKS = [f"FUEL TANK {t} QUANTITY" for t in (
     "LEFT MAIN", "RIGHT MAIN", "CENTER", "CENTER2", "CENTER3", "LEFT AUX", "RIGHT AUX",

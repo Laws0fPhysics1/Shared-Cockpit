@@ -6,6 +6,7 @@ standard-rate circle near Seattle. Freeze events, data writes and switch
 events all act on the dict exactly like the real sim would, and the GUI's
 dry-run panel reads/writes the same dict.
 """
+import json
 import math
 import struct
 import threading
@@ -63,7 +64,17 @@ class FakeSim:
             "FUEL TANK LEFT MAIN QUANTITY": 26.0, "FUEL TANK RIGHT MAIN QUANTITY": 26.0,
             "PAYLOAD STATION COUNT": 2.0,
             "PAYLOAD STATION WEIGHT:1": 170.0, "PAYLOAD STATION WEIGHT:2": 170.0,
+            "GENERAL ENG COMBUSTION:1": 1.0, "REALISM CRASH DETECTION": 1.0,
+            "AMBIENT TEMPERATURE": 15.0, "AMBIENT VISIBILITY": 20000.0, "AMBIENT PRECIP STATE": 2.0,
+            # pretend aircraft-specific cockpit variables (like the A320neo overhead)
+            "L:XMLVAR_OVHD_BAT1": 1.0, "L:XMLVAR_OVHD_APU_MASTER": 0.0,
+            "L:XMLVAR_OVHD_SEATBELTS": 0.0, "L:A320_FCU_ALT_SEL": 10000.0,
+            "L:FAKE_SYS_CLOCK": 0.0,          # changes by itself every frame (must be ignored)
+            "L:XMLVAR_BLINK_STATE": 0.0,      # filtered by name
         }
+        self.events_by_name = {}
+        self.scratchpad = ""                   # pretend MCDU scratchpad (H-event keys)
+        self.loaded_flights = 0
         self.alt_base, self.alt_amp = 3000.0, 150.0   # tests can fly it low
         self.history = deque(maxlen=4000)              # (t, lat, lon, alt, frozen) per frame
         self.defs = {}       # define_id -> [(name, dtype)]
@@ -112,6 +123,9 @@ class FakeSim:
             if name in FREEZE_VARS:
                 self.state[FREEZE_VARS[name]] = 1.0 if value else 0.0
                 return
+            if name in ("ENGINE_AUTO_START", "ENGINE_AUTO_SHUTDOWN"):
+                self.state["GENERAL ENG COMBUSTION:1"] = 1.0 if name == "ENGINE_AUTO_START" else 0.0
+                return
             m = self.events.get(name)
             if not m:
                 return
@@ -123,8 +137,40 @@ class FakeSim:
             else:
                 self.state[var] = 0.0 if self.state.get(var, 0.0) >= 0.5 else 1.0
 
-    def subscribe_system(self, *_a):
-        pass
+    def subscribe_system(self, event_id, name):
+        self.events_by_name[name] = event_id
+
+    # -- dry-run stand-ins for the in-sim bridge / MobiFlight / flight files --
+    def lvar_names(self):
+        with self.lock:
+            return [n[2:] for n in self.state if n.startswith("L:")]
+
+    def press_h(self, name):
+        """A pretend MCDU: CDU key events type into a scratchpad."""
+        key = name.rsplit("_BTN_", 1)[-1] if "_CDU_" in name else ""
+        with self.lock:
+            if key == "CLR":
+                self.scratchpad = self.scratchpad[:-1]
+            elif len(key) == 1:
+                self.scratchpad = (self.scratchpad + key)[-16:]
+
+    def flight_save(self, path, title="", description="", flags=0):
+        with self.lock:
+            data = {k: v for k, v in self.state.items() if isinstance(v, float)}
+        with open(path + ".FLT", "w", encoding="utf-8") as f:
+            f.write("[Main]\nTitle=" + title + "\n[SharedCockpitDryRun]\n" + json.dumps(data))
+
+    def flight_load(self, path):
+        with open(path + ".FLT", encoding="utf-8") as f:
+            data = json.loads(f.read().split("[SharedCockpitDryRun]\n", 1)[1])
+        with self.lock:
+            for k, v in data.items():
+                if not k.startswith("IS ") and not k.startswith("L:"):
+                    self.state[k] = v           # like a real .FLT: no L:vars
+            self.loaded_flights += 1
+        eid = self.events_by_name.get("FlightLoaded")
+        if eid is not None:
+            self.queue.append(("event", eid, 0))
 
     def poll(self):
         now = time.perf_counter()
@@ -183,6 +229,7 @@ class FakeSim:
         with self.lock:
             s = self.state
             now = time.perf_counter()
+            s["L:FAKE_SYS_CLOCK"] = s.get("L:FAKE_SYS_CLOCK", 0.0) + 1.0   # a self-changing L:var
             frozen = s.get("IS LATITUDE LONGITUDE FREEZE ON", 0.0) >= 0.5
             if frozen:
                 return                      # positions are logged when the engine writes them
