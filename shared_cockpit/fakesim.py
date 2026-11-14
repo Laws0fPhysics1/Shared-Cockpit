@@ -5,9 +5,15 @@ It keeps simvars in a dict by name. When not frozen, the airplane flies a
 standard-rate circle near Seattle. Freeze events, data writes and switch
 events all act on the dict exactly like the real sim would, and the GUI's
 dry-run panel reads/writes the same dict.
+
+crj_mode (env SC_FAKE_CRJ=1, or FakeSim(crj_mode=True)) pretends to be an
+Aerosoft CRJ whose WASM owns parts of the cockpit (see _crj_frame): knob value
+L:vars that only move on turn pulses, MCDU key L:vars that type into a pretend
+scratchpad, and LIGHT LANDING forced from the aircraft's own switch L:var.
 """
 import json
 import math
+import os
 import struct
 import threading
 import time
@@ -24,6 +30,17 @@ FREEZE_VARS = {
     "FREEZE_ALTITUDE_SET": "IS ALTITUDE FREEZE ON",
     "FREEZE_ATTITUDE_SET": "IS ATTITUDE FREEZE ON",
 }
+
+# --- crj_mode: pretend Aerosoft CRJ -------------------------------------------
+CRJ_TITLE, CRJ_MODEL = "Aerosoft CRJ 550 Dry Run", "CRJ5"
+# value var -> (step var, animation var, change per pulse, wrap or None, accepts direct writes)
+CRJ_KNOBS = {
+    "L:ASCRJ_FCP_ALT_INFO": ("L:ASCRJ_FCP_ALT_CHANGE", "L:ASCRJ_FCP_ALT_SEL", 100.0, None, False),
+    "L:ASCRJ_FCP_HDG_INFO": ("L:ASCRJ_FCP_HDG_CHANGE", "L:ASCRJ_FCP_HDG_SEL", 1.0, 360.0, True),
+}
+CRJ_KEYS = [chr(c) for c in range(ord("A"), ord("Z") + 1)] + [str(i) for i in range(10)] + ["CLR"]
+CRJ_MCDU = {f"L:ASCRJ_MCDU1_{k}": k for k in CRJ_KEYS}
+CRJ_PRESS_MS = 100           # how long the CRJ holds a key / knob-turn L:var non-zero
 
 
 def _event_map():
@@ -43,7 +60,7 @@ class FakeSim:
     has_input_events = False
     dll_path = "built-in dry-run simulator"
 
-    def __init__(self, *_a, **_k):
+    def __init__(self, *_a, crj_mode=None, **_k):
         self.lock = threading.Lock()
         self.state = {
             "TITLE": "Dry Run Trainer", "ATC MODEL": "DRYRUN", "NUMBER OF ENGINES": 1.0,
@@ -77,6 +94,7 @@ class FakeSim:
         self.scratchpad = ""                   # pretend captain MCDU scratchpad (H-event keys)
         self.scratchpad2 = ""                  # pretend first officer MCDU
         self.loaded_flights = 0
+        self.lvar_list_cap = None              # int: lvar_names() lists only the first N (MobiFlight caps at 1000)
         self.alt_base, self.alt_amp = 3000.0, 150.0   # tests can fly it low
         self.history = deque(maxlen=4000)              # (t, lat, lon, alt, frozen) per frame
         self.defs = {}       # define_id -> [(name, dtype)]
@@ -86,6 +104,20 @@ class FakeSim:
         self.t0 = self.last = time.perf_counter()
         self.next_frame = self.t0
         self.next_second = self.t0
+        # crj_mode (pretend Aerosoft CRJ WASM)
+        self.crj_mode = (os.environ.get("SC_FAKE_CRJ") == "1") if crj_mode is None else bool(crj_mode)
+        self._crj_ready = False
+        self.crj_scratchpad = ""               # pretend CRJ MCDU1 scratchpad (typed by ASCRJ_MCDU1_* keys)
+        self.crj_typed = []                    # every key the pretend MCDU accepted, in order
+        self.crj_pulses = {}                   # step var -> turn pulses the pretend WASM acted on
+        self.crj_reverts = {}                  # value var -> direct writes it reverted
+        self._crj_val = {}                     # knob value var -> the WASM's own value
+        self._crj_prev = {}                    # var -> value at the previous frame boundary
+        self._crj_release = []                 # [(perf time, var, rest)] pilot clicks to release
+        self._crj_turns = []                   # [(step var, sign)] queued pilot knob clicks
+        self._crj_turn_at = 0.0
+        if self.crj_mode:
+            self._crj_install()
 
     # -- SimConnect-compatible surface ---------------------------------
     def open(self):
@@ -175,7 +207,14 @@ class FakeSim:
     # -- dry-run stand-ins for the in-sim bridge / MobiFlight / flight files --
     def lvar_names(self):
         with self.lock:
-            return [n[2:] for n in self.state if n.startswith("L:")]
+            names = [n[2:] for n in self.state if n.startswith("L:")]   # dict keeps insertion order
+        cap = self.lvar_list_cap
+        return names[:cap] if isinstance(cap, int) else names
+
+    def add_lvar(self, name, value=0.0):
+        """The aircraft's own code creates an L:var late (like a WASM module after load)."""
+        with self.lock:
+            self.state.setdefault("L:" + name, float(value))
 
     def press_h(self, name):
         """A pretend MCDU: CDU key events type into a scratchpad."""
@@ -214,6 +253,8 @@ class FakeSim:
             self.last = now
             self.next_frame = now + FRAME
             self._physics(dt)
+            if self.crj_mode:
+                self._crj_frame(now)
             for rid, r in list(self.reqs.items()):
                 if r[1] in (PERIOD_SIM_FRAME, PERIOD_VISUAL_FRAME):
                     r[4] += 1
@@ -285,3 +326,103 @@ class FakeSim:
             s["PLANE BANK DEGREES"] = -25.0
             s["ROTATION VELOCITY BODY Y"] = math.radians(3.0)
             s["AILERON POSITION"] = -0.1
+
+    # -- crj_mode: pretend Aerosoft CRJ --------------------------------------
+    def _crj_install(self):
+        with self.lock:
+            s = self.state
+            s["TITLE"], s["ATC MODEL"], s["NUMBER OF ENGINES"] = CRJ_TITLE, CRJ_MODEL, 2.0
+            s.setdefault("L:ASCRJ_FCP_ALT_INFO", 10000.0)
+            s.setdefault("L:ASCRJ_FCP_HDG_INFO", 90.0)
+            for v, (step, anim, *_r) in CRJ_KNOBS.items():
+                s.setdefault(step, 0.0)
+                s.setdefault(anim, 0.0)
+                self._crj_val[v] = s[v]
+                self.crj_pulses[step] = 0
+                self.crj_reverts[v] = 0
+            for n in CRJ_MCDU:
+                s.setdefault(n, 0.0)
+            for n in ("L:ASCRJ_OVHD_LDG_LT", "L:ASCRJ_PARK_BRAKE", "L:ASCRJ_ELEVTRIM", "L:ASCRJ_FCP_AP_ENG"):
+                s.setdefault(n, 0.0)
+            s["LIGHT LANDING"] = s["L:ASCRJ_OVHD_LDG_LT"]
+            self._crj_prev = {n: s.get(n, 0.0) for n in list(CRJ_MCDU) + [k[0] for k in CRJ_KNOBS.values()]}
+        self._crj_ready = True
+
+    def _crj_frame(self, now):
+        """One frame of the pretend CRJ WASM, run from the frame loop under the lock.
+        It samples its L:vars only here, at frame boundaries, like the real thing: a
+        pulse written and cleared between two frames is never seen."""
+        if not self._crj_ready:
+            self._crj_install()
+        with self.lock:
+            s = self.state
+            # the pilot's own clicks (crj_press / crj_turn) are released after their hold time
+            keep = []
+            for t, var, rest in self._crj_release:
+                if now >= t:
+                    s[var] = rest
+                else:
+                    keep.append((t, var, rest))
+            self._crj_release = keep
+            if self._crj_turns and now >= self._crj_turn_at:
+                step, sign = self._crj_turns.pop(0)
+                s[step] = float(sign)
+                self._crj_release.append((now + CRJ_PRESS_MS / 1000.0, step, 0.0))
+                self._crj_turn_at = now + CRJ_PRESS_MS / 1000.0 + 0.04
+            # knobs: the WASM owns the value; it moves once per turn pulse (rest -> non-rest edge)
+            for v, (step, anim, inc, wrap, direct) in CRJ_KNOBS.items():
+                own = self._crj_val[v]
+                cur = s.get(v, own)
+                if abs(cur - own) > 1e-9:
+                    if direct:
+                        own = cur % wrap if wrap else cur
+                    else:
+                        self.crj_reverts[v] = self.crj_reverts.get(v, 0) + 1
+                st = s.get(step, 0.0)
+                if st != 0.0 and self._crj_prev.get(step, 0.0) == 0.0:
+                    d = inc if st > 0 else -inc
+                    own = (own + d) % wrap if wrap else own + d
+                    s[anim] = (s.get(anim, 0.0) + (1.0 if st > 0 else -1.0)) % 30.0   # knob animation frame
+                    self.crj_pulses[step] = self.crj_pulses.get(step, 0) + 1
+                self._crj_prev[step] = st
+                self._crj_val[v] = own
+                s[v] = own
+            # MCDU keys: a key L:var going 0 -> non-zero types once
+            for n, key in CRJ_MCDU.items():
+                val = s.get(n, 0.0)
+                if val != 0.0 and self._crj_prev.get(n, 0.0) == 0.0:
+                    self.crj_typed.append(key)
+                    pad = self.crj_scratchpad
+                    self.crj_scratchpad = pad[:-1] if key == "CLR" else (pad + key)[-24:]
+                self._crj_prev[n] = val
+            # the CRJ owns its lights: LIGHT LANDING follows its own switch L:var
+            s["LIGHT LANDING"] = s.get("L:ASCRJ_OVHD_LDG_LT", 0.0)
+
+    def crj_press(self, name, value=1.0, ms=CRJ_PRESS_MS, rest=0.0):
+        """The pilot clicks a CRJ button: its L:var is `value` for `ms`, then `rest`."""
+        if not name.startswith("L:"):
+            name = "L:" + name
+        with self.lock:
+            self.state[name] = float(value)
+            self._crj_release.append((time.perf_counter() + ms / 1000.0, name, float(rest)))
+
+    def crj_turn(self, value_var, clicks):
+        """The pilot turns a CRJ knob `clicks` detents (negative = down), one pulse per ~140 ms."""
+        if not value_var.startswith("L:"):
+            value_var = "L:" + value_var
+        step = CRJ_KNOBS[value_var][0]
+        with self.lock:
+            self._crj_turns.extend([(step, 1 if clicks > 0 else -1)] * abs(int(clicks)))
+
+    def crj_value(self, value_var):
+        """The knob value the pretend CRJ shows: its own value, not a direct write it
+        is about to revert at the next frame."""
+        if not value_var.startswith("L:"):
+            value_var = "L:" + value_var
+        with self.lock:
+            return self._crj_val.get(value_var, self.state.get(value_var, 0.0))
+
+    def crj_busy(self):
+        """Pilot clicks still queued or held."""
+        with self.lock:
+            return bool(self._crj_turns or self._crj_release)

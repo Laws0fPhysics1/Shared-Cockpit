@@ -20,12 +20,12 @@ import threading
 import time
 from collections import deque
 
-from . import flavor, net, syncdefs as sd
+from . import flavor, net, profiles, syncdefs as sd
 from .simconnect import (Block, SimConnect, SimConnectError, PERIOD_NEVER, PERIOD_ONCE,
                          PERIOD_SIM_FRAME, PERIOD_SECOND, FLAG_CHANGED, DT_STRING256,
                          DT_FLOAT64)
 
-PROTO = 3
+PROTO = 4               # 4: aircraft-profile presses ("lp") and knobs ("kn")
 SEND_HZ = 40.0          # PF motion packets per second
 BUF_START, BUF_MIN, BUF_MAX = 0.12, 0.035, 0.60   # total playback delay behind the PF (s)
 BUF_SLEW = 0.08         # max change of the shown delay per second (8% playback speed)
@@ -740,6 +740,8 @@ class Engine:
                 continue
             if abs(v - prev) <= tol:
                 continue                        # didn't change locally
+            if key in self.cp.sw_off:
+                continue                        # the aircraft profile turned it off
             if key in self.sw_noisy or (key in sd.AP_MODE_KEYS and self.cp.screen_ap):
                 continue
             known = self.sw_known.get(key)
@@ -774,6 +776,10 @@ class Engine:
             for k, v in out.items():
                 self.cp.slog.add("out", "switch", k, v)
 
+    def _sw_state(self):
+        """Every switch reading, without the ones the aircraft profile turned off."""
+        return {k: v for k, v in self.sw_prev.items() if k not in self.cp.sw_off}
+
     def _apply_switches(self, values, full=False):
         if not (self.sc and self.ready):
             return
@@ -784,6 +790,9 @@ class Engine:
                 continue
             _, var, unit, kind, arg, scale = s
             if key in self.sw_noisy or (key in sd.AP_MODE_KEYS and self.cp.screen_ap):
+                continue
+            if key in self.cp.sw_off or profiles.switch_off(self.cp.profile, key):
+                self.cp.slog.add("skip", "switch", key, v, "off for this aircraft (profile)")
                 continue
             self.sw_known[key] = v
             self.sw_pending.pop(key, None)          # the co-pilot's newer value wins
@@ -840,6 +849,8 @@ class Engine:
         self.ie_last[name] = v
         if any(k in name.upper() for k in sd.INPUT_EVENT_SKIP):
             return
+        if profiles.input_event_off(self.cp.profile, name):
+            return
         if name in self.ie_action or name in self.ie_noisy:
             return
         if prev is not None and abs(v - prev) < 1e-9:
@@ -870,6 +881,9 @@ class Engine:
             return
         h = self.ie_by_name.get(name)
         if h is None:
+            return
+        if profiles.input_event_off(self.cp.profile, name):
+            self.cp.slog.add("skip", "input", name, v, "off for this aircraft (profile)")
             return
         self.ie_recent.setdefault(name, deque(maxlen=12)).append((net.now(), v))
         self.ie_last[name] = v
@@ -1004,13 +1018,13 @@ class Engine:
             if self.role == "host":
                 # Host is authoritative on connect: who flies + full switch state.
                 self._send({"t": "ctl", "e": self.ctl_epoch, "pf": self.pf or "host"})
-                self._send({"t": "swfull", "s": dict(self.sw_prev)})
+                self._send({"t": "swfull", "s": self._sw_state()})
         elif t == "title":
             self.peer["title"] = msg["title"]
             self.peer["model"] = msg.get("model", "")
             self._check_titles()
             if self.role == "host":
-                self._send({"t": "swfull", "s": dict(self.sw_prev)})
+                self._send({"t": "swfull", "s": self._sw_state()})
         elif t == "ping":
             self._send({"t": "pong", "x": msg["x"], "y": net.now()})
         elif t == "pong":
@@ -1053,6 +1067,8 @@ class Engine:
             return
         self.cp.tick(t)
         if self.sw_pending:
+            for k in [k for k in self.sw_pending if k in self.cp.sw_off]:
+                del self.sw_pending[k]
             done = {k: v for k, (v, t0) in self.sw_pending.items() if t - t0 >= sd.settle_s(k)}
             for k in done:
                 del self.sw_pending[k]

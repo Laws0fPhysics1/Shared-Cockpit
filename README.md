@@ -136,7 +136,24 @@ New-NetFirewallRule -DisplayName "Shared Cockpit UDP" -Direction Inbound -Protoc
 - **Something didn't sync?** The **Sync inspector** tab lists every event sent, received, applied,
   failed or skipped, and everything goes to `logs/sync-*.log` too. Variables that should never
   sync can be listed in `shared_cockpit/lvar_ignore.txt` (one regex per line).
-- Study-level add-ons (PMDG, Fenix, FBW, ...) keep state in their own systems; expect partial switch sync.
+- **Restart MSFS before switching aircraft.** MobiFlight lists at most 1000 cockpit variables, and
+  variables from aircraft flown earlier stay in the list until the sim restarts. The app re-checks the
+  list for about a minute after an aircraft loads, since some add-ons (e.g. the Aerosoft CRJ) create
+  their variables late. It also watches variables named in an aircraft profile
+  (`shared_cockpit/profiles/*.json`), ones the co-pilot sends, and ones that synced before
+  (`lvar_cache.json`, kept across updates).
+- Study-level add-ons (PMDG, Fenix, FBW, ...) keep state in their own systems; expect partial switch
+  sync unless the aircraft has a profile.
+- **Aircraft profiles** (`shared_cockpit/profiles/*.json`, picked by aircraft title) tell the app how an
+  add-on works. Each L:var is a *state* (mirror the value), a *press* (momentary button, sent once
+  per press) or *ignore* (animation/display). *Knobs* sync their real value: the other side writes it,
+  or turns its own knob until it matches. A profile can also turn off generic switches the aircraft
+  owns (`switches_off`), the autopilot key relay (`k_relay`), and input events (`input_events_off`).
+  The **Aerosoft CRJ** profile ships with v1.3.0. Both pilots need v1.3.0 (protocol 4).
+- **Checking a profile in the sim:** with the aircraft loaded (no co-pilot needed), run for example
+  `python tools/probe.py --sim 2020 knob ASCRJ_FCP_ALT_INFO ASCRJ_FCP_ALT_CHANGE`. It tells you
+  whether the aircraft accepts a direct write and how far one knob pulse moves the value. The other
+  commands are `read`, `watch` (prints every change while you click), `write` and `press`.
 - MSFS 2024 has a known slight jitter when an app places an aircraft every frame (YourControls has
   the same issue).
 
@@ -145,7 +162,8 @@ New-NetFirewallRule -DisplayName "Shared Cockpit UDP" -Direction Inbound -Protoc
 - Tests (no sim needed): `python tests/test_loopback.py`, `test_dryrun.py`, `test_smooth.py`
   (measures smoothness under simulated packet loss and lag), `test_updater.py`, `test_cockpit.py`
   (L:vars, FMS keys, Match, Copy flight, checklist), `test_wsbridge.py`, `test_mobiflight.py`,
-  `test_bridge_install.py`.
+  `test_bridge_install.py`, `test_lvar_discovery.py` (late L:vars, list cap, profiles, cache), `test_crj_profile.py` (pretend CRJ:
+  presses, knobs, switches_off, Match; `SC_FAKE_CRJ=1` runs the dry-run sim as a CRJ).
 - **Publishing: double-click `publish.bat`.** On the first run it asks for your GitHub repo
   (create an empty one first) and sets it in `install.bat` and the updater. Every run checks tests,
   offers a version bump (installed copies then get an update prompt), commits and pushes.

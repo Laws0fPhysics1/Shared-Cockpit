@@ -4,3 +4,4 @@ settings.json
 sdk_dll/
 *.dll
 logs/
+lvar_cache.json

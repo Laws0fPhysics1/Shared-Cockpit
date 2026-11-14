@@ -10,8 +10,9 @@ import zipfile
 from .version import BRANCH, REPO, __version__
 
 UA = {"User-Agent": "SharedCockpit-updater"}
-# Never overwritten by an update: user settings and downloaded SimConnect DLLs.
-KEEP = {"settings.json", "sdk_dll", "SimConnect.dll", ".git"}
+# Never overwritten by an update: user settings, downloaded SimConnect DLLs and the
+# learned L:var name cache.
+KEEP = {"settings.json", "sdk_dll", "SimConnect.dll", ".git", "lvar_cache.json"}
 
 
 def configured():
